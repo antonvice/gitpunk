@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "gitpunk-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-04",
+  "artifacts": [{ "binding": "ARTIFACTS", "namespace": "gitpunk-dev" }],
+  "d1_databases": [{ "binding": "DB", "database_name": "gitpunk-dev", "database_id": "REPLACE_WITH_D1_ID" }],
+  "r2_buckets": [{ "binding": "CONTENT", "bucket_name": "gitpunk-dev-content" }],
+  "durable_objects": { "bindings": [{ "name": "BRANCHES", "class_name": "BranchCoordinator" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["BranchCoordinator"] }],
+  "vars": { "KAFKA_GATEWAY_URL": "https://REPLACE_WITH_GATEWAY_HOST", "OIDC_ISSUER": "https://REPLACE_WITH_OIDC_ISSUER" }
+}

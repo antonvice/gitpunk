@@ -1,0 +1,12 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "gitpunk-artifacts-bridge",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-04",
+  "workers_dev": false,
+  "preview_urls": false,
+  "limits": { "cpu_ms": 50 },
+  "artifacts": [{ "binding": "ARTIFACTS", "namespace": "gitpunk-dev" }],
+  "vars": { "GITPUNK_IMPORT_HOSTS": "github.com", "GITPUNK_ENABLED_UNTIL": "" }
+  // Deploy GITPUNK_INTERNAL_TOKEN from an ignored secrets file; see README.md.
+}

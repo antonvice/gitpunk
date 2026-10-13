@@ -1,0 +1,8 @@
+{
+  "title": "Add car model and CRUD",
+  "type": "feature",
+  "summary": "Extend Car persistence and add CRUD services.",
+  "files": ["models.py", "services.py"],
+  "done_when": ["CRUD tests pass", "Existing models still work"],
+  "sharing": "summary"
+}

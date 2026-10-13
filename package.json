@@ -1,0 +1,37 @@
+{
+  "name": "gitpunk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared intent, live drafts and checked integration for coding agents",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "gitpunk": "client/cli.js"
+  },
+  "scripts": {
+    "start": "node scripts/mvp.js",
+    "demo:mvp": "node scripts/mvp-example.js",
+    "package:mvp": "node scripts/package.js",
+    "server": "node server/index.js",
+    "test": "node --test",
+    "demo": "node scripts/demo.js",
+    "demo:checks": "node scripts/checked-demo.js",
+    "demo:kafka-recovery": "node scripts/kafka-recovery.js",
+    "demo:cloudflare": "node scripts/cloudflare-smoke.js",
+    "test:docker": "GITPUNK_DOCKER_TESTS=1 node --test server/runner.test.js tests/checked-demo.test.js",
+    "build:cloudflare": "wrangler deploy --dry-run --config server/cloudflare/wrangler.example.jsonc --outdir .local/cloudflare-build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.3.1",
+    "@modelcontextprotocol/server": "2.3.1",
+    "kafkajs": "2.2.4",
+    "openid-client": "6.8.8",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "jose": "6.2.12",
+    "wrangler": "4.150.0"
+  }
+}

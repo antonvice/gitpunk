@@ -1,0 +1,7 @@
+{
+  "issuer": "https://accounts.google.com",
+  "client_id": "REPLACE_WITH_OAUTH_CLIENT_ID",
+  "client_secret": "REPLACE_WITH_OAUTH_CLIENT_SECRET",
+  "public_url": "http://127.0.0.1:8787",
+  "allow_loopback_http": true
+}
