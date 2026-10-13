@@ -161,7 +161,8 @@ test('commit bundles contain committed bytes and fetch without changing dirty pe
   // These hooks reject ref updates; managed export/fetch must suppress them.
   for (const workspace of [workspaces.alice, workspaces.bob]) {
     await writeFile(join(workspace, '.git', 'hooks', 'reference-transaction'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
-    await assert.rejects(git(workspace, 'update-ref', 'refs/gitpunk/hook-probe', base), /ref updates aborted by hook/);
+    await assert.rejects(git(workspace, 'update-ref', 'refs/gitpunk/hook-probe', base), error => error.code === 128);
+    assert.equal(await git(workspace, 'for-each-ref', '--format=%(refname)', 'refs/gitpunk/hook-probe'), '');
   }
   await writeFile(join(workspaces.alice, 'models.py'), 'unstaged sender work\n');
   const files = await committedFiles(workspaces.alice, base, commit);
