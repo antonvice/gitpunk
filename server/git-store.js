@@ -13,7 +13,7 @@ const gitEnvironment = extra => ({ ...Object.fromEntries(Object.entries(process.
 // Fetching bundles never checks out code, runs hooks or reads agent Git config.
 export async function storedGit(directory, ...args) {
   const env = gitEnvironment();
-  const result = await execute('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'protocol.file.allow=always', '-c', 'transfer.fsckObjects=true', '-C', directory, ...args], { encoding: 'buffer', timeout: 30_000, maxBuffer: 20 * 1024 * 1024, env });
+  const result = await execute('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'protocol.file.allow=always', '-c', 'transfer.fsckObjects=true', '-C', directory, ...args], { encoding: 'buffer', timeout: 30_000, maxBuffer: 20 * 1024 * 1024, env });
   return result.stdout;
 }
 const text = async (directory, ...args) => (await storedGit(directory, ...args)).toString('utf8').trim();
