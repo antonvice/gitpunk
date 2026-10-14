@@ -9,15 +9,17 @@ const decode = bytes => new TextDecoder('utf-8', { fatal: true }).decode(bytes);
 /** Repo queries work without a checkout. Only immutable Git IDs enter the shared cache. */
 export function createSourceStore(gitStore, db) {
   const cache = new ImmutableCache(); let active = 0, gitCommands = 0;
-  const run = async (...args) => { gitCommands++; return gitInput(gitStore.directory, args, '', 1024 * 1024); };
-  const tree = oid => cache.get(`tree:${oid}`, () => { gitCommands++; return readTree(gitStore.directory, oid); });
+  const use = (action, lazy = false) => gitStore.use ? gitStore.use(action, lazy) : action();
+  const run = async (...args) => { gitCommands++; await gitStore.ensure?.(); return gitInput(gitStore.directory, args, '', 1024 * 1024); };
+  const tree = oid => cache.get(`tree:${oid}`, async () => { if (gitStore.tree) return gitStore.tree(oid); gitCommands++; return readTree(gitStore.directory, oid); });
   async function visible(commit) {
+    if (db.prepare('SELECT 1 FROM git_commits WHERE repo_id=? AND commit_id=?').get(gitStore.config.repo_id, commit)) return true;
     if (db.prepare('SELECT 1 FROM checks c JOIN uploads u ON u.id=c.submission_id WHERE u.repo_id=? AND c.candidate=? LIMIT 1').get(gitStore.config.repo_id, commit)) return true;
-    const tip = gitStore.readRefSync('refs/heads/main');
+    const tip = await gitStore.readRef('refs/heads/main');
     const generation = db.prepare('SELECT COALESCE(MAX(rowid),0) AS n FROM uploads').get().n;
     return cache.get(`visible:${tip}:${generation}:${commit}`, () => gitStore.knownBase(commit));
   }
-  async function root(commit) { return cache.get(`root:${commit}`, async () => (await run('rev-parse', `${commit}^{tree}`)).toString().trim()); }
+  async function root(commit) { return cache.get(`root:${commit}`, async () => gitStore.root ? gitStore.root(commit) : (await run('rev-parse', `${commit}^{tree}`)).toString().trim()); }
   async function metadata(commit, path) {
     let oid = await root(commit), entry;
     const parts = path.split('/');
@@ -27,19 +29,21 @@ export function createSourceStore(gitStore, db) {
       if (index < parts.length - 1 && entry.type !== 'tree') return null;
       oid = entry.oid;
     }
-    return { ...entry, path };
+    return { ...entry, path, size: entry.type === 'blob' && entry.size === null ? await gitStore.objectSize(entry.oid) : entry.size };
   }
   async function bytes(entry) {
     if (entry.type !== 'blob' || !['100644', '100755'].includes(entry.mode)) fail('unsupported_git_mode', 'Only regular files can be read.', 403);
     if (entry.size > 1024 * 1024) fail('source_too_large', 'Read API file limit is 1 MiB.', 413);
-    return cache.get(`blob:${entry.oid}`, async () => { gitCommands++; return (await readBlobs(gitStore.directory, [entry.oid], 1024 * 1024)).get(entry.oid); });
+    return cache.get(`blob:${entry.oid}`, async () => { if (gitStore.blob) return gitStore.blob(entry.oid); gitCommands++; return (await readBlobs(gitStore.directory, [entry.oid], 1024 * 1024)).get(entry.oid); });
   }
   async function query(raw, allow) {
     const input = SourceQuery.parse(raw);
     if (++active > 16) { active--; fail('source_busy', 'Source service is busy; retry shortly.', 429); }
     try {
       if (!await visible(input.commit) || input.base && !await visible(input.base)) fail('unknown_commit', 'Commit is outside accepted repository history.', 404);
+      const graph = () => gitStore.hydrateHistory?.([input.commit, ...(input.base ? [input.base] : [])]);
       if (input.action === 'compare') return cache.get(`compare:${input.base}:${input.commit}`, async () => {
+        await graph();
         const merge_base = (await run('merge-base', input.base, input.commit)).toString().trim();
         return { base: input.base, commit: input.commit, merge_base, base_is_ancestor: merge_base === input.base, commit_is_ancestor: merge_base === input.commit };
       });
@@ -64,16 +68,17 @@ export function createSourceStore(gitStore, db) {
         return { commit: input.commit, ...entry, content_base64: (await bytes(entry)).toString('base64') };
       }
       if (input.action === 'diff') return { base: input.base, commit: input.commit, paths: input.paths, diff: await cache.get(`diff:${JSON.stringify(input)}`, async () => decode(await run('diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--no-color', input.base, input.commit, '--', ...input.paths.map(path => `:(literal)${path}`)))) };
-      if (input.action === 'history') return { commit: input.commit, path: input.path, history: await cache.get(`history:${JSON.stringify(input)}`, async () => decode(await run('log', `--max-count=${input.limit}`, '--format=%H%x00%at%x00%s', input.commit, '--', `:(literal)${input.path}`)).trimEnd().split('\n').filter(Boolean).map(line => { const [commit, time, ...subject] = line.split('\0'); return { commit, time: Number(time), subject: subject.join('\0') }; })) };
+      if (input.action === 'history') return { commit: input.commit, path: input.path, history: await cache.get(`history:${JSON.stringify(input)}`, async () => { await graph(); return decode(await run('log', `--max-count=${input.limit}`, '--format=%H%x00%at%x00%s', input.commit, '--', `:(literal)${input.path}`)).trimEnd().split('\n').filter(Boolean).map(line => { const [commit, time, ...subject] = line.split('\0'); return { commit, time: Number(time), subject: subject.join('\0') }; }); }) };
       if (input.end < input.start || input.end - input.start >= 500) fail('invalid_range', 'Read at most 500 blame lines.');
-      return { commit: input.commit, path: input.path, blame: await cache.get(`blame:${JSON.stringify(input)}`, async () => decode(await run('blame', '--line-porcelain', '-L', `${input.start},${input.end}`, input.commit, '--', input.path))) };
+      return { commit: input.commit, path: input.path, blame: await cache.get(`blame:${JSON.stringify(input)}`, async () => { await graph(); return decode(await run('blame', '--line-porcelain', '-L', `${input.start},${input.end}`, input.commit, '--', input.path)); }) };
     } finally { active--; }
   }
   return {
-    query, metadata, tree, bytes,
+    query: (raw, allow) => use(() => query(raw, allow), true), metadata: (commit, path) => use(() => metadata(commit, path)), tree: oid => use(() => tree(oid)), bytes: entry => use(() => bytes(entry)),
     stats: () => ({ ...cache.stats(), active, git_commands: gitCommands }),
-    async commit(base, checkpoints, message, eventId) {
+    commit: (base, checkpoints, message, eventId) => use(async () => {
       if (!await visible(base)) fail('unknown_base', 'Commit parent is outside accepted history.', 409);
+      await gitStore.hydrate?.([base], checkpoints.map(item => item.path));
       const edits = new Map();
       for (const item of checkpoints) {
         const entry = await metadata(base, item.path);
@@ -97,11 +102,12 @@ export function createSourceStore(gitStore, db) {
         }
         if (!entries.size && prefix) return null;
         const input = [...entries.values()].map(entry => `${entry.mode} ${entry.type} ${entry.oid}\t${entry.path}\0`).join('');
-        return (await gitInput(gitStore.directory, ['mktree', '-z'], input)).toString().trim();
+        return (await gitInput(gitStore.directory, ['mktree', '--missing', '-z'], input)).toString().trim();
       }
       const nextTree = await rewrite(await root(base));
       const commit = (await gitInput(gitStore.directory, ['-c', 'user.name=Gitpunk', '-c', 'user.email=gitpunk@example.invalid', 'commit-tree', nextTree, '-p', base], message + `\n\nGitpunk-Request: ${eventId}\n`)).toString().trim();
+      await gitStore.persist?.();
       return commit;
-    },
+    }),
   };
 }

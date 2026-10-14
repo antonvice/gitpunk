@@ -3,13 +3,14 @@ import { promisify } from 'node:util';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, writeFile, rm, rename, access, lstat } from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { ProtocolError, canonicalJson, MAX_BUNDLE_BYTES } from '../shared/index.js';
 import { readBlobs } from './git-objects.js';
 
 const execute = promisify(execFile);
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const deny = (code, message, status = 400, details) => { throw new ProtocolError(code, message, status, details); };
-const gitEnvironment = extra => ({ ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))), GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_TERMINAL_PROMPT: '0', GIT_NO_REPLACE_OBJECTS: '1', ...extra });
+const gitEnvironment = extra => ({ ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))), PATH: `${fileURLToPath(new URL('./bin/', import.meta.url))}:${process.env.PATH}`, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_TERMINAL_PROMPT: '0', GIT_NO_REPLACE_OBJECTS: '1', ...extra });
 // Fetching bundles never checks out code, runs hooks or reads agent Git config.
 export async function storedGit(directory, ...args) {
   const env = gitEnvironment();
@@ -18,6 +19,41 @@ export async function storedGit(directory, ...args) {
 }
 const text = async (directory, ...args) => (await storedGit(directory, ...args)).toString('utf8').trim();
 const exists = async file => { try { await access(file); return true; } catch { return false; } };
+
+export async function gitChanges(repo, base, commit) {
+  const raw = await storedGit(repo, 'diff-tree', '--no-commit-id', '--no-renames', '--no-ext-diff', '--no-textconv', '--no-abbrev', '--raw', '-r', '-z', base, commit);
+  let parts;
+  try { parts = new TextDecoder('utf-8', { fatal: true }).decode(raw).split('\0'); }
+  catch { deny('invalid_git_path', 'Git paths must use valid UTF-8.'); }
+  const result = [];
+  for (let i = 0; i < parts.length - 1; i += 2) {
+    const [, oldMode, newMode, oldId, newId, status] = parts[i].match(/^:(\d{6}) (\d{6}) ([a-f0-9]+) ([a-f0-9]+) ([A-Z])$/) ?? [];
+    if (!status || !['A','M','D','T'].includes(status)) deny('unsupported_git_change', 'Unsupported Git change type.');
+    const oldPresent = oldMode !== '000000', newPresent = newMode !== '000000';
+    if ([oldPresent && oldMode, newPresent && newMode].some(mode => mode && !['100644','100755'].includes(mode))) deny('unsupported_git_mode', 'Symlinks and submodules are not accepted.', 403, { path: parts[i + 1] });
+    result.push({ path: parts[i + 1], operation: !oldPresent ? 'create' : !newPresent ? 'delete' : 'modify', oldId: oldPresent ? oldId : null, newId: newPresent ? newId : null, base_mode: oldPresent ? oldMode : null, result_mode: newPresent ? newMode : null });
+  }
+  const blobs = await readBlobs(repo, result.flatMap(file => [file.oldId, file.newId].filter(Boolean)), 20 * 1024 * 1024);
+  return result.map(({ oldId, newId, ...file }) => {
+    const baseBytes = oldId ? blobs.get(oldId) : null, resultBytes = newId ? blobs.get(newId) : null;
+    return { ...file, base_hash: baseBytes === null ? null : hash(baseBytes), result_hash: resultBytes === null ? null : hash(resultBytes), baseBytes, resultBytes };
+  });
+}
+
+export async function buildGitCandidate(directory, { base, target, commit, operationId, createdAt }) {
+  let output;
+  try { output = await text(directory, 'merge-tree', '--write-tree', `--merge-base=${base}`, target, commit); }
+  catch (error) {
+    if (error.code === 1) return { state: 'conflict', details: error.stdout?.toString('utf8').slice(0, 8000) ?? 'Git reported a merge conflict.' };
+    throw error;
+  }
+  const tree = output.split('\n')[0];
+  const date = `${Math.floor(createdAt / 1000)} +0000`;
+  // Stable parents, metadata and operation ID make crash replay deterministic.
+  const env = gitEnvironment({ GIT_AUTHOR_NAME: 'Gitpunk integrator', GIT_AUTHOR_EMAIL: 'integrator@example.invalid', GIT_COMMITTER_NAME: 'Gitpunk integrator', GIT_COMMITTER_EMAIL: 'integrator@example.invalid', GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date });
+  const result = await execute('git', ['-c', 'core.hooksPath=/dev/null', '-C', directory, 'commit-tree', tree, '-p', target, '-p', commit, '-m', `Gitpunk integration ${operationId}`], { encoding: 'utf8', timeout: 30_000, env });
+  return { state: 'candidate', candidate: result.stdout.trim(), tree };
+}
 
 export async function createGitStore({ dataDir, source, db }) {
   const directory = path.join(dataDir, 'git', 'demo.git');
@@ -52,30 +88,11 @@ export async function createGitStore({ dataDir, source, db }) {
     try { await storedGit(directory, 'merge-base', '--is-ancestor', base, 'refs/heads/main'); return true; } catch {}
     return false;
   }
-  async function changes(repo, base, commit) {
-    const raw = await storedGit(repo, 'diff-tree', '--no-commit-id', '--no-renames', '--no-ext-diff', '--no-textconv', '--no-abbrev', '--raw', '-r', '-z', base, commit);
-    let parts;
-    try { parts = new TextDecoder('utf-8', { fatal: true }).decode(raw).split('\0'); }
-    catch { deny('invalid_git_path', 'Git paths must use valid UTF-8.'); }
-    const result = [];
-    for (let i = 0; i < parts.length - 1; i += 2) {
-      const [, oldMode, newMode, oldId, newId, status] = parts[i].match(/^:(\d{6}) (\d{6}) ([a-f0-9]+) ([a-f0-9]+) ([A-Z])$/) ?? [];
-      if (!status || !['A','M','D','T'].includes(status)) deny('unsupported_git_change', 'Unsupported Git change type.');
-      const oldPresent = oldMode !== '000000', newPresent = newMode !== '000000';
-      if ([oldPresent && oldMode, newPresent && newMode].some(mode => mode && !['100644','100755'].includes(mode))) deny('unsupported_git_mode', 'Symlinks and submodules are not accepted.', 403, { path: parts[i + 1] });
-      result.push({ path: parts[i + 1], operation: !oldPresent ? 'create' : !newPresent ? 'delete' : 'modify', oldId: oldPresent ? oldId : null, newId: newPresent ? newId : null, base_mode: oldPresent ? oldMode : null, result_mode: newPresent ? newMode : null });
-    }
-    const blobs = await readBlobs(repo, result.flatMap(file => [file.oldId, file.newId].filter(Boolean)), 20 * 1024 * 1024);
-    return result.map(({ oldId, newId, ...file }) => {
-      const baseBytes = oldId ? blobs.get(oldId) : null, resultBytes = newId ? blobs.get(newId) : null;
-      return { ...file, base_hash: baseBytes === null ? null : hash(baseBytes), result_hash: resultBytes === null ? null : hash(resultBytes), baseBytes, resultBytes };
-    });
-  }
   let targetCache, targetTask;
   return {
     directory, config, knownBase,
     history: async (base, commit) => (await text(directory, 'rev-list', commit, `^${base}`)).split('\n').filter(Boolean),
-    changes: (base, commit) => changes(directory, base, commit),
+    changes: (base, commit) => gitChanges(directory, base, commit),
     async recordCreated(commit, { eventId, runId }) {
       const ref = `refs/gitpunk/runs/${runId}/${eventId}`;
       const existing = await text(directory, 'rev-parse', '--verify', ref).catch(() => null);
@@ -107,7 +124,7 @@ export async function createGitStore({ dataDir, source, db }) {
           const promise = (async () => {
             const snapshot = { origin: 'server', branch: config.branch, base_commit: config.base_commit, commit, files: [], bundle_hash: null, bundle_content: null };
             if (commit === config.base_commit) return snapshot;
-            snapshot.files = (await changes(directory, config.base_commit, commit)).map(({ baseBytes, resultBytes, ...file }) => file).sort((a,b) => a.path.localeCompare(b.path));
+            snapshot.files = (await gitChanges(directory, config.base_commit, commit)).map(({ baseBytes, resultBytes, ...file }) => file).sort((a,b) => a.path.localeCompare(b.path));
             const temporary = await mkdtemp(path.join(dataDir, 'target-'));
             const file = path.join(temporary, 'target.bundle'), ref = `refs/gitpunk/exports/${randomUUID()}`;
             try {
@@ -128,21 +145,8 @@ export async function createGitStore({ dataDir, source, db }) {
       const { bundle_content, ...metadata } = targetCache;
       return withBundle ? { ...metadata, bundle_content } : metadata;
     },
-    async buildCandidate({ base, target, commit, operationId, createdAt }) {
-      let output;
-      try { output = await text(directory, 'merge-tree', '--write-tree', `--merge-base=${base}`, target, commit); }
-      catch (error) {
-        if (error.code === 1) return { state: 'conflict', details: error.stdout?.toString('utf8').slice(0, 8000) ?? 'Git reported a merge conflict.' };
-        throw error;
-      }
-      const tree = output.split('\n')[0];
-      const date = `${Math.floor(createdAt / 1000)} +0000`;
-      // Stable parents, metadata and operation ID make crash replay deterministic.
-      const env = gitEnvironment({ GIT_AUTHOR_NAME: 'Gitpunk integrator', GIT_AUTHOR_EMAIL: 'integrator@example.invalid', GIT_COMMITTER_NAME: 'Gitpunk integrator', GIT_COMMITTER_EMAIL: 'integrator@example.invalid', GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date });
-      const result = await execute('git', ['-c', 'core.hooksPath=/dev/null', '-C', directory, 'commit-tree', tree, '-p', target, '-p', commit, '-m', `Gitpunk integration ${operationId}`], { encoding: 'utf8', timeout: 30_000, env });
-      return { state: 'candidate', candidate: result.stdout.trim(), tree };
-    },
-    async candidateChanges(target, candidate) { return changes(directory, target, candidate); },
+    buildCandidate: input => buildGitCandidate(directory, input),
+    async candidateChanges(target, candidate) { return gitChanges(directory, target, candidate); },
     readRefSync(ref) { return execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-C', directory, 'rev-parse', '--verify', ref], { encoding: 'utf8', timeout: 5000, env: gitEnvironment() }).trim(); },
     compareAndSwap(target, candidate) {
       execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-C', directory, 'update-ref', 'refs/heads/main', candidate, target], { encoding: 'utf8', timeout: 5000, env: gitEnvironment() });
@@ -185,9 +189,9 @@ export async function createGitStore({ dataDir, source, db }) {
           inspect(null, metadata, 'metadata');
           const parents = (await text(temporary, 'rev-list', '--parents', '-n', '1', commit)).split(' ').slice(1);
           if (!parents.length) deny('unrelated_history', 'Candidate history contains an unrelated root commit.');
-          for (const parent of parents) for (const change of await changes(temporary, parent, commit)) inspect(change, change.resultBytes, 'change');
+          for (const parent of parents) for (const change of await gitChanges(temporary, parent, commit)) inspect(change, change.resultBytes, 'change');
         }
-        const actual = (await changes(temporary, input.base_commit, input.commit)).map(({ baseBytes, resultBytes, ...file }) => file).sort((a,b) => a.path.localeCompare(b.path));
+        const actual = (await gitChanges(temporary, input.base_commit, input.commit)).map(({ baseBytes, resultBytes, ...file }) => file).sort((a,b) => a.path.localeCompare(b.path));
         const declared = [...input.files].sort((a,b) => a.path.localeCompare(b.path));
         if (canonicalJson(actual) !== canonicalJson(declared)) deny('manifest_mismatch', 'Signed files differ from the actual committed diff.', 409, { actual });
         const ref = `refs/gitpunk/runs/${runId}/${eventId}`;

@@ -1,9 +1,10 @@
 import { execFile } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 
 export const blobHash = (bytes, format = 'sha1') => createHash(format).update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
 export function gitInput(directory, args, input, maxBuffer = 20 * 1024 * 1024) {
-  const env = { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))), GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_NO_REPLACE_OBJECTS: '1', GIT_TERMINAL_PROMPT: '0' };
+  const env = { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))), PATH: `${fileURLToPath(new URL('./bin/', import.meta.url))}:${process.env.PATH}`, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_NO_REPLACE_OBJECTS: '1', GIT_TERMINAL_PROMPT: '0' };
   return new Promise((resolve, reject) => {
     const child = execFile('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-C', directory, ...args], { env, encoding: 'buffer', timeout: 30_000, maxBuffer }, (error, stdout) => error ? reject(error) : resolve(stdout));
     child.stdin.on('error', () => {}); child.stdin.end(input);

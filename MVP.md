@@ -73,6 +73,8 @@ For a fresh recording, start `npm start -- --data-dir=.local/mvp-recording --por
 
 The same example works without agent checkouts: `npm start -- --remote`, then `npm run demo:mvp -- --data-dir=.local/mvp-remote`. It commits handed-off drafts through the server and uses the same checks/approval path.
 
+For the object backend, use `npm start -- --objects`, then `npm run demo:mvp -- --data-dir=.local/mvp-objects`. The real Workers runtime runs R2 and SQLite DO locally; no Cloudflare credentials or writes are involved.
+
 `npm run demo:checks` separately demonstrates two individual passes, a clean combined merge that fails the owner contract, and a repair that preserves both changes. `npm run demo -- --kafka` proves an independent broker consumer and durable restart recovery.
 
 ## Verified on this Mac
@@ -80,6 +82,10 @@ The same example works without agent checkouts: `npm start -- --remote`, then `n
 October 13, 2026: all **103 tests passed**, with real Docker enabled and no skips. Modern/legacy MCP clients, saved WIP, overlap denial, protected paths, private transcript omission, compact agent status and restart preservation passed. The dependency audit found zero vulnerabilities; the Workers bundle passed a deployment dry run. Real Kafka previously consumed all 14 accepted collaboration-demo events. The visible MCP example handed off two files and one decision, passed checks, and integrated. These are scripted clients; no LLM execution claim is made.
 
 October 14: all **119 tests passed**, with real Docker and no skips, including checkout-free source/commit/handoff, cache bounds/revocation, concurrent checks, receipt loss and old-store migration. The real MCP/Kafka/Docker remote example integrated two files without agent Git checkouts. Two [matched local benchmarks](SCALING.md) measured native Git partial/sparse clones as well as full clones; all 16 benchmark candidates passed real Docker checks and integrated once.
+
+The release suite passed all **122 tests** with real Docker and no skips; both Worker bundles passed dry runs.
+
+The R2/DO example also completed the two-file MCP handoff, decision, real Docker check and manual approval path. Save-to-peer time was 1.756 seconds. Native Git reads, signed commits, racing CAS, durable quotas, lost receipts and complete runtime restarts have dedicated local workerd tests. These clients and owner approvals are scripted.
 
 ## Boundaries
 

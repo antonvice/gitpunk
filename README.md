@@ -19,10 +19,11 @@ Gitpunk adds shared intent, live drafts and checked integration to ordinary Git.
 - Shared decisions and pinned handoffs: code, agreed decisions and unfinished criteria.
 - Ordinary Git commits, automatic uploads and peer fetch without changing staging.
 - Checkout-free source queries and server commits from signed drafts; bounded shared caches.
+- Optional R2 object storage and durable branch CAS; selected native Git inputs replace a full server mirror.
 - Sparse, concurrent Docker checks of exact combined candidates; owner approval and ordered integration.
 - Live branch board; summaries shared by default, raw prompts/context opt-in.
 
-**Status:** working local MVP with development identities. The Workers/Artifacts bridge has passed a separate live Git test; connecting it to the collaboration flow, production enrollment and real-model verification remain in the [roadmap](Roadmap.md). File permissions protect publication; unrestricted local agents still need a sandbox.
+**Status:** working local MVP with development identities. R2/DO runs in the real local Workers runtime. The Workers/Artifacts bridge passed a separate live Git test. Cloud collaboration, production enrollment and real-model verification remain in the [roadmap](Roadmap.md). File permissions protect publication; unrestricted local agents still need a sandbox.
 
 ## Run
 
@@ -39,6 +40,8 @@ Open [localhost:8787/board](http://127.0.0.1:8787/board) and choose `.local/mvp/
 On a fresh instance, `npm run demo:mvp` shows overlap, decisions, handoff, checks and integration using scripted MCP clients. Bring your own coding agent using the generated profiles: [MVP setup](MVP.md).
 
 For sparse workspaces, run `npm start -- --remote` and use `.local/mvp-remote/` profiles. `npm run bench:scale` compares full/partial Git clones, cached source reads and real concurrent Docker checks.
+
+`npm start -- --objects` runs the same MVP on local R2/DO with `.local/mvp-objects/` profiles. `npm run bench:objects` tests object storage and checked integration. [Backend setup and limits](server/cloudflare/OBJECTS.md).
 
 Development stays local. Cloudflare tests require fresh usage visibility and bounded activation: [cost rules](COSTS.md). [Submission steps](SUBMISSION.md).
 

@@ -145,7 +145,7 @@ test('prepared canonical update recovers the missing SQLite receipt without appl
   const env = await setup(t);
   env.app.db.exec("CREATE TRIGGER reject_integrated_event BEFORE INSERT ON events WHEN NEW.type='integration.finished' BEGIN SELECT RAISE(ABORT,'simulate receipt loss'); END;");
   const a = await env.submit('alice', 'models.py', 'model = "durable integration"\n');
-  const before = await env.until(status => status.operations.some(row => row.state === 'prepared'));
+  const before = await env.until(status => status.last_error && status.operations.some(row => row.state === 'prepared'));
   const operation = before.operations[0];
   assert.equal(await env.app.gitStore.readRef('refs/heads/main'), operation.candidate);
   assert.equal(env.app.db.prepare("SELECT count(*) AS n FROM events WHERE type='integration.finished'").get().n, 0);

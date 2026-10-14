@@ -20,9 +20,10 @@
     "demo:checks": "node scripts/checked-demo.js",
     "demo:kafka-recovery": "node scripts/kafka-recovery.js",
     "bench:scale": "node scripts/scale-benchmark.js",
+    "bench:objects": "node scripts/object-benchmark.js",
     "demo:cloudflare": "node scripts/cloudflare-smoke.js",
     "test:docker": "GITPUNK_DOCKER_TESTS=1 node --test server/runner.test.js tests/checked-demo.test.js",
-    "build:cloudflare": "wrangler deploy --dry-run --config server/cloudflare/wrangler.example.jsonc --outdir .local/cloudflare-build"
+    "build:cloudflare": "wrangler deploy --dry-run --config server/cloudflare/wrangler.example.jsonc --outdir .local/cloudflare-build && wrangler deploy --dry-run --config server/cloudflare/objects.wrangler.jsonc --outdir .local/objects-build"
   },
   "dependencies": {
     "@modelcontextprotocol/client": "2.3.1",
@@ -32,7 +33,9 @@
     "zod": "4.6.5"
   },
   "devDependencies": {
+    "esbuild": "0.28.2",
     "jose": "6.2.12",
+    "miniflare": "5.20261006.2-beta",
     "wrangler": "4.150.0"
   }
 }

@@ -6,10 +6,11 @@ import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { CheckPolicy, SafePath, canonicalJson, hashContent } from '../shared/index.js';
 import { readBlobs } from './git-objects.js';
+import { storedGit } from './git-store.js';
 
 const exec = promisify(execFile);
 const docker = (...args) => exec('docker', args, { encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 10_000 });
-const git = (directory, ...args) => exec('git', ['-C', directory, '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...args], { encoding: 'buffer', maxBuffer: 65 * 1024 * 1024, timeout: 10_000, env: { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))), GIT_NO_REPLACE_OBJECTS: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' } });
+const git = async (directory, ...args) => ({ stdout: await storedGit(directory, '-c', 'core.fsmonitor=false', ...args) });
 
 function boundedLogs(result, limit) {
   let remaining = limit;

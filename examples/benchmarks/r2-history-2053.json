@@ -1,0 +1,34 @@
+{
+  "checked_at": "2026-10-14T18:50:11.667Z",
+  "fixture": "98f1e7d5efbe588bc7323364120a92358026585c",
+  "commit_count": 2053,
+  "cold_history_ms": 3361.157708,
+  "earliest_changed_commit": "3ffc131023138e24a5c117b10dfae96faafe7a09",
+  "history_ancestry_blame_match": true,
+  "backend": {
+    "active": 0,
+    "peak_active": 1,
+    "operations": 4,
+    "downloaded_bytes": 508370,
+    "downloaded_objects": 2067,
+    "peak_cache_bytes": 432694,
+    "retained_git_bytes": 0,
+    "object_cache": {
+      "hits": 8215,
+      "misses": 2054,
+      "bytes": 506156,
+      "entries": 2054,
+      "pending": 0
+    }
+  },
+  "source_sha256": {
+    "server/cloudflare/objects.js": "80a05de3f55331339387e33d0ff0ccc43a19aa8e5e702349a21af583f033722d",
+    "server/object-store.js": "0cab9dafc7db3a425214c3b472aa14f0536eb8b879efba42d5dd4211256a55fb",
+    "server/source.js": "c15f20adfc10801af249a1e594ad5c54ede45584f00e441bbc6fda16973438fa",
+    "server/git-store.js": "94e388a32e765737f8983b8db34855c2f8482440e113d0a3973c8419b3fef682",
+    "server/remote-helper.js": "8d69d1ef33014e555d67c93d466af2ba54e2ebc3e15e9168285cab4553e58a6b"
+  },
+  "cloud_writes": false,
+  "warm_history_compare_blame_ms": 1789.4411249999998,
+  "measurement_note": "Warm total includes history, ancestry and blame; it is not a single-query latency. History response caching was subsequently changed to skip hydration on warm hits."
+}

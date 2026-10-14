@@ -57,22 +57,21 @@ export function createCoordinator({ db, gitStore, policy: inputPolicy, authorize
       event(record, `stale-${result.id}`, 'checks.stale', { id: result.id, submission_id: record.id, target: result.target, candidate: result.candidate, reason });
     });
   }
-  function integrate(record, result) {
-    const observed = gitStore.readRefSync('refs/heads/main');
+  async function integrate(record, result) {
+    const observed = await gitStore.readRef('refs/heads/main');
     if (observed !== result.target) { stale(record, result, 'target_changed'); return; }
     gate(record, result);
     const operationId = `integrate-${result.id}`;
     const data = { policy, result: json(result.result), approved: policy.approval === 'automatic' ? 'automatic-demo-policy' : json(db.prepare('SELECT data FROM approvals WHERE check_id=?').get(result.id).data) };
     // This record survives a crash between Git's ref update and the SQLite receipt.
     db.prepare("INSERT OR IGNORE INTO integration_ops(id,submission_id,check_id,target,candidate,policy_hash,state,data) VALUES(?,?,?,?,?,?,'prepared',?)").run(operationId, record.id, result.id, result.target, result.candidate, policyHash, JSON.stringify(data));
-    return tx(db, () => {
-      gate(record, check(result.id));
-      if (gitStore.readRefSync('refs/heads/main') !== result.target) fail('stale_target', 'Canonical target changed before integration.');
-      gitStore.compareAndSwap(result.target, result.candidate);
-      return completeOperation({ ...result, id: operationId, check_id: result.id }, record);
-    });
+    if (await gitStore.readRef('refs/heads/main') !== result.target) fail('stale_target', 'Canonical target changed before integration.');
+    gate(record, check(result.id));
+    // Authorization is rechecked immediately before dispatch; never await inside SQLite.
+    await gitStore.compareAndSwap(result.target, result.candidate, operationId);
+    return tx(db, () => completeOperation({ ...result, id: operationId, check_id: result.id }, record));
   }
-  function recover(resetChecking = false) {
+  async function recover(resetChecking = false) {
     // Checking processes disappear on restart; their results cannot be guessed.
     if (resetChecking) tx(db, () => {
       for (const result of db.prepare("SELECT * FROM checks WHERE state IN ('building','running')").all()) {
@@ -85,8 +84,10 @@ export function createCoordinator({ db, gitStore, policy: inputPolicy, authorize
     });
     for (const op of db.prepare("SELECT * FROM integration_ops WHERE state='prepared' ORDER BY rowid").all()) {
       const record = upload(op.submission_id), result = check(op.check_id);
-      const current = gitStore.readRefSync('refs/heads/main');
-      if (current === op.candidate) tx(db, () => completeOperation(op, record));
+      const receipt = await gitStore.operationReceipt?.(op.id);
+      const current = await gitStore.readRef('refs/heads/main');
+      if (receipt && (receipt.expected !== op.target || receipt.candidate !== op.candidate)) fail('invalid_receipt', 'Canonical receipt does not match the prepared operation.');
+      if (receipt || current === op.candidate) tx(db, () => completeOperation(op, record));
       else if (current !== op.target || op.policy_hash !== policyHash) stale(record, result, 'interrupted_target_or_policy_changed');
       // If the old target remains, flush revalidates authority before retrying CAS.
     }
@@ -99,7 +100,8 @@ export function createCoordinator({ db, gitStore, policy: inputPolicy, authorize
       db.prepare("UPDATE submissions SET state='checking',attempt=attempt+1,check_id=?,reason=NULL WHERE id=?").run(id, record.id);
       db.prepare("INSERT INTO checks(id,submission_id,target,policy_hash,state,scope,signing_key,created_at) VALUES(?,?,?,?,'building',?,?,?)").run(id, record.id, target, policyHash, actor.scope, actor.public_key, Date.now());
     });
-    const candidate = await gitStore.buildCandidate({ base: manifest.base_commit, target, commit: record.commit_id, operationId: id, createdAt: record.created_at });
+    const paths = manifest.files.map(file => file.path);
+    const candidate = await gitStore.buildCandidate({ base: manifest.base_commit, target, commit: record.commit_id, paths, operationId: id, createdAt: record.created_at });
     if (candidate.state === 'conflict') {
       tx(db, () => {
         db.prepare("UPDATE checks SET state='conflict',result=? WHERE id=?").run(JSON.stringify(candidate), id);
@@ -109,13 +111,14 @@ export function createCoordinator({ db, gitStore, policy: inputPolicy, authorize
       return;
     }
     // Validate Git's merged result, not only the originally uploaded patch.
-    for (const change of await gitStore.candidateChanges(target, candidate.candidate)) inspect(record, actor, change);
+    for (const change of await gitStore.candidateChanges(target, candidate.candidate, paths)) inspect(record, actor, change);
     db.prepare("UPDATE checks SET candidate=?,state='running' WHERE id=?").run(candidate.candidate, id);
     return check(id);
   }
   async function evaluate(record, prepared) {
     const { id, target, candidate } = prepared;
-    const returned = await runner({ directory: gitStore.directory, candidate, policy });
+    const execute = async () => { await gitStore.hydrate?.([candidate], policy.source_paths, true); return runner({ directory: gitStore.directory, candidate, policy }); };
+    const returned = await (gitStore.use ? gitStore.use(execute) : execute());
     if (returned.target !== undefined && returned.target !== target) fail('invalid_check_binding', 'Runner returned a different target.');
     const result = CheckResult.parse({ ...returned, target });
     if (result.candidate !== candidate || result.policy_hash !== policyHash || result.image_digest !== policy.image) fail('invalid_check_binding', 'Runner returned evidence for different code or environment.');
@@ -125,9 +128,9 @@ export function createCoordinator({ db, gitStore, policy: inputPolicy, authorize
       event(record, id, 'checks.finished', { id, submission_id: record.id, target, candidate, policy_hash: policyHash, state: result.state, result });
     });
   }
-  function blocked(record, error) {
+  async function blocked(record, error) {
     const op = db.prepare("SELECT * FROM integration_ops WHERE submission_id=? AND state='prepared'").get(record.id);
-    if (op && gitStore.readRefSync('refs/heads/main') === op.candidate) { lastError = 'Integration receipt pending recovery'; return false; }
+    if (op && (gitStore.distributed || await gitStore.readRef('refs/heads/main') === op.candidate)) { lastError = 'Integration receipt pending recovery'; return false; }
     tx(db, () => {
       db.prepare("UPDATE checks SET state='error',result=? WHERE id=(SELECT check_id FROM submissions WHERE id=?) AND state IN ('building','running')").run(JSON.stringify({ state: 'error', code: error.code ?? 'coordinator_error', message: error.message }), record.id);
       db.prepare("UPDATE submissions SET state='failed',reason=? WHERE id=?").run(error.code ?? 'coordinator_error', record.id);
@@ -135,25 +138,26 @@ export function createCoordinator({ db, gitStore, policy: inputPolicy, authorize
     });
     return true;
   }
-  function admit() {
+  async function admit() {
     for (;;) {
       const head = db.prepare("SELECT * FROM submissions WHERE state IN ('queued','checking','awaiting_approval') ORDER BY order_seq LIMIT 1").get();
       if (!head || head.state !== 'awaiting_approval') return;
       const record = upload(head.id), result = check(head.check_id);
       try {
         authorize(record);
-        if (gitStore.readRefSync('refs/heads/main') !== result.target || result.policy_hash !== policyHash) { stale(record, result, 'target_or_policy_changed'); continue; }
+        if (await gitStore.readRef('refs/heads/main') !== result.target || result.policy_hash !== policyHash) { stale(record, result, 'target_or_policy_changed'); continue; }
         if (policy.approval === 'manual' && !db.prepare('SELECT 1 FROM approvals WHERE check_id=?').get(result.id)) return;
-        integrate(record, result);
-      } catch (error) { if (!blocked(record, error)) return; }
+        await integrate(record, result);
+      } catch (error) { if (error.code === 'stale_target') { stale(record, result, 'target_changed'); continue; } if (!await blocked(record, error)) return; }
     }
   }
   async function flush() {
     if (busy || stopped || !gitStore || !policy) return;
     busy = true;
     try {
-      lastError = null; recover(); enqueue(); admit();
-      let target = gitStore.readRefSync('refs/heads/main');
+      lastError = null; await recover(); enqueue(); await admit();
+      if (!db.prepare("SELECT 1 FROM submissions WHERE state IN ('queued','checking','awaiting_approval') LIMIT 1").get()) return;
+      let target = await gitStore.readRef('refs/heads/main');
       // A bounded prefix of exact combined candidates can be tested concurrently.
       // Only the short, ordered CAS admission remains serial. Failed prefixes recheck.
       const window = db.prepare("SELECT * FROM submissions WHERE state IN ('queued','checking','awaiting_approval') ORDER BY order_seq LIMIT ?").all(policy.check_concurrency);
@@ -173,23 +177,23 @@ export function createCoordinator({ db, gitStore, policy: inputPolicy, authorize
           const promise = evaluate(record, prepared).catch(error => blocked(record, error)).finally(() => jobs.delete(prepared.id));
           jobs.set(prepared.id, { submission_id: record.id, promise });
           checksStarted++; peakChecks = Math.max(peakChecks, jobs.size);
-        } catch (error) { if (!blocked(record, error)) break; }
+        } catch (error) { if (!await blocked(record, error)) break; }
       }
-      recover(); admit();
+      await recover(); await admit();
     } catch (error) { lastError = error.message; }
     finally { busy = false; }
   }
   return {
     policy, policyHash,
-    start() { if (!gitStore || !policy) return; try { recover(true); } catch (error) { lastError = error.message; } timer = setInterval(flush, 250); timer.unref(); void flush(); },
+    async start() { if (!gitStore || !policy) return; try { await recover(true); } catch (error) { lastError = error.message; } timer = setInterval(flush, 250); timer.unref(); void flush(); },
     flush,
-    approve(auth, envelope, input) {
+    approve(auth, envelope, input, currentTarget) {
       if (!policy || policy.approval !== 'manual') fail('approval_not_required', 'Manual approval is not configured.');
       if (!['admin','maintainer'].includes(auth.role)) fail('forbidden', 'Approval requires a repository administrator or maintainer.', 403);
       const result = check(input.check_id), record = upload(input.submission_id);
       if (!result || !record || result.submission_id !== record.id || record.repo_id !== auth.repo_id) fail('not_found', 'Check/submission not found.', 404);
       if (result.state !== 'passed' || input.candidate !== result.candidate || input.target !== result.target || input.policy_hash !== result.policy_hash || result.policy_hash !== policyHash) fail('stale_approval', 'Approval must name this exact passing candidate, target and policy.');
-      if (gitStore.readRefSync('refs/heads/main') !== result.target) fail('stale_target', 'Target changed; new checks are required.');
+      if (currentTarget !== result.target) fail('stale_target', 'Target changed; new checks are required.');
       db.prepare('INSERT OR REPLACE INTO approvals(check_id,run_id,data,envelope) VALUES(?,?,?,?)').run(result.id, auth.id, JSON.stringify({ ...input, signing_key: auth.public_key }), JSON.stringify(envelope));
       return { state: 'approved', submission_id: record.id, check_id: result.id, candidate: result.candidate, target: result.target, policy_hash: result.policy_hash };
     },

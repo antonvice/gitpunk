@@ -1,0 +1,14 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "gitpunk-objects",
+  "main": "objects.js",
+  "compatibility_date": "2026-10-13",
+  "workers_dev": false,
+  "preview_urls": false,
+  "limits": { "cpu_ms": 50 },
+  "r2_buckets": [{ "binding": "OBJECTS", "bucket_name": "gitpunk-objects" }],
+  "durable_objects": { "bindings": [{ "name": "BRANCHES", "class_name": "Branch" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Branch"] }],
+  "vars": { "GITPUNK_REPO": "demo", "GITPUNK_ENABLED_UNTIL": "", "GITPUNK_MAX_REQUESTS": "0", "GITPUNK_MAX_WRITE_BYTES": "0" }
+  // Local runtime tests need no Cloudflare credentials. Cloud writes need COSTS.md gates.
+}

@@ -4,6 +4,8 @@
 
 Working locally: signed intent/WIP, Kafka pub/sub, decisions, handoffs, commit upload/fetch, optional OIDC browser login, isolated checks and ordered integration. `npm start` launches the [MVP](MVP.md); agents use three stdio MCP tools and private per-workspace profiles. The Artifacts bridge is live-verified; hosted coordination, Artifacts-backed working uploads, live identity setup and model verification remain open. See [Roadmap.md](Roadmap.md) and [server design](server/techdoc.md).
 
+`npm start -- --objects` uses R2 objects and a Durable Object head in local workerd. File reads avoid Git; commits/checks batch selected objects into disposable native Git caches. The three agent tools stay the same. [Backend limits](server/cloudflare/OBJECTS.md).
+
 ## Use
 
 | Command | Job |

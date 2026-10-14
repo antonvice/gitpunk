@@ -1,6 +1,6 @@
 # Agent-scale Gitpunk
 
-Gitpunk addresses checkout traffic, duplicated objects, expensive client operations and serial checks while keeping ordinary Git. The local implementation is measured below. It is not a replacement for Anthropic's distributed Scion backend.
+Gitpunk addresses checkout traffic, duplicated objects, expensive client operations, full server copies and serial checks while keeping ordinary Git. Its R2/DO backend is implemented and measured in local workerd. Production Scion-scale qualification remains open.
 
 ## What works
 
@@ -14,9 +14,9 @@ Gitpunk addresses checkout traffic, duplicated objects, expensive client operati
 | CI materializes unrelated source | Owner-pinned `source_paths`; batched blob reads; no Git checkout/index in runners | Owner must include the check's dependencies |
 | Work waits behind other checks | Concurrent checks of a bounded FIFO candidate prefix; short ordered CAS integration | Failed/changed prefixes recheck; approval stays explicit |
 | Monorepo permissions | Source reads and writes enforce path scope; cached reuse reauthorizes | Downloaded bytes cannot be recalled; local agents need isolation |
-| Full server mirrors outgrow a node | Stable source API separates client behavior from backend storage | Complete local bare Git store remains; distributed storage is next |
+| Full server mirrors outgrow a node | R2 compressed objects; direct reads; disposable, batched native Git inputs; DO conditional heads | Real local runtime proof; one collaboration/auth gateway; cloud deployment remains gated |
 
-Intents, signed WIP, Kafka/cursor pub/sub, decisions, handoffs, legacy Git upload/fetch and exact approvals remain intact. Accepted commit IDs are indexed; arbitrary objects and unadmitted refs are unreadable. Status calls do not build bundles. Legacy clients request bundles explicitly.
+Intents, signed WIP, Kafka/cursor pub/sub, decisions, handoffs and exact approvals remain intact. Legacy Git upload/fetch uses the local Git backend; R2 uses signed drafts/source APIs. Accepted commit IDs are indexed; arbitrary objects and unadmitted refs are unreadable. Status calls do not build bundles.
 
 Server-created commit provenance is precise: the agent signed the request and content hashes, while the server chose the Git commit ID. A legacy fetch verifies those signatures, the authenticated manifest, bundle hash and actual Git diff.
 
@@ -60,6 +60,34 @@ The benchmark saves full private receipts under ignored `.local/scale-*/receipt.
 
 ## Scale gate
 
-The next backend must avoid a fully materialized repository on a single server. Keep this API, move immutable objects/derived data behind independently scalable storage and reader caches, bound metadata retention, and run checks in a worker pool. Validate cache outage/backpressure, exact conditional updates and revocation across nodes.
+The full server mirror is removed in the R2 option. Local workerd tests verify two-agent integration, restart persistence, missing receipts, denied unadmitted objects, revocation on cached reads, racing CAS and a durable request quota. The MCP/Kafka/Docker handoff also ran on this backend; save-to-peer time was 1.756 seconds.
 
-Before claiming Anthropic-scale readiness, test 100 GB of history, a 25 GB worktree, sustained 30,000 merges/day and representative checkout/query demand. Measure p50/p95 latency, CPU, storage, bytes transferred, stale rechecks and failure recovery. Local benchmarks and a separate Artifacts bridge test cannot prove that gate. See [Roadmap](Roadmap.md).
+## Larger object-backend trial
+
+October 14, one Mac, local workerd/R2/SQLite DO, native Git and real Docker. [Public receipt](examples/benchmarks/r2-local-100gib.json).
+
+| Measurement | Result |
+|---|---:|
+| Distinct logical history / latest worktree | 100 GiB / 25 GiB |
+| Initial history commits / stored objects | 2,053 / 53,394 |
+| Random, incompressible blob data | 1 GiB |
+| Compressed R2 object bytes / runtime disk | 1.182 GB / 1.203 GB |
+| Selected read p50 / p95, 32 requests | 1.79 / 2.50 ms |
+| Checked integrations, two concurrent scripted clients | 128 in 104.31 s; 1.23/s |
+| Full pipeline object reads / largest temporary Git cache | 1.45 MB / 43,445 bytes |
+| Persistent server Git copy | 0 bytes |
+| Conditional branch updates + receipt reads | 27,575 in 120 s; p95 7.06 ms |
+
+Every accepted change survived in the canonical files. Checks export only `parts`, parse the Python source and calculate a 600,000-iteration checksum. Approval is explicitly automatic for this benchmark. Branch-update throughput excludes merge computation and CI; the checked-integration row includes intent, draft, server commit, Docker and admission.
+
+A follow-up [history receipt](examples/benchmarks/r2-history-2053.json) walked all 2,053 initial commits: cold path history took 3.36 s; ancestry and blame matched the original source. The three warm history/ancestry/blame calls together took 1.79 s. Only 508 KB of object data was read; temporary Git storage peaked at 433 KB. Subsequent warm history caching skips graph hydration.
+
+This fixture has **100 GiB of logical Git blob history**, mostly zeros with unique prefixes. It is not 100 GiB of physical, incompressible history. R2 storage compression, physical storage, and the 1 GiB dense portion are explicit. The short rate exceeds 30,000/day's average arrival rate, but does not establish daily production capacity, representative CI, regional latency or failure behavior. Both clients and approvals are scripted; no models or cloud services were called. Cache entry/metadata improvements after the throughput run are noted in its receipt.
+
+Reproduce with the pinned Docker image available:
+
+```sh
+npm run bench:objects -- --history-gib=100 --worktree-gib=25 --dense-mib=1024 --commits=2048 --jobs=128 --seconds=120
+```
+
+Before claiming Anthropic-scale readiness: deploy under an approved budget; test dense physical history, larger objects/history indexes, regional readers, multi-node authorization/recovery and a sustained representative 30,000 checked merges/day. [Backend limits](server/cloudflare/OBJECTS.md) · [Roadmap](Roadmap.md).

@@ -12,6 +12,8 @@ Loopback-only Node server; SQLite is the authoritative branch log. Kafka receive
 
 Add `--git-source=/absolute/path/to/repository` once to seed a local bare Git store from trusted source `HEAD`. Accepted agent commits get immutable working refs. Without configured checks, canonical `main` remains unchanged.
 
+Alternatively, `npm start -- --objects` uses local workerd/R2/DO without a full server Git copy. A configured cloud adapter uses `--object-config=<private JSON>` instead of `--git-source`. [Object backend](cloudflare/OBJECTS.md).
+
 Add `--check-config=infra/checks.example.json` to enable owner-configured Docker checks and the integration queue. Pull the pinned image first. Manual approval is the default; use a signed `respond:approve` naming the exact submission/check/target/candidate/policy tuple. Local integration supports configured `main` only. `retry_check` requests new evidence; failed work leaves the ready queue.
 
 `check_concurrency` bounds speculative FIFO checks (1–8; starter 4). Optional `source_paths` pins the exact files/directories exported to every check. Agents cannot choose these settings. Failed or stale prefixes recheck before ordered admission.
@@ -53,7 +55,7 @@ Prototype upload limits: 4 MiB bundle, 16 MiB total new objects, 1 MiB per objec
 
 ## Boundary
 
-This runs locally on the Mac with a bare Git store and Docker test containers. It does not deploy Cloudflare resources. Optional human login requires provider configuration and live verification. Local draft baseline hashes remain signed claims; committed uploads are checked against actual Git content. `uploaded` means stored and read back; `checked` and `integrated` require separate exact evidence.
+This runs locally on the Mac with a bare Git store or R2/DO adapter and Docker test containers. It does not deploy Cloudflare resources. Optional human login requires provider configuration and live verification. Local draft baseline hashes remain signed claims; committed uploads are checked against actual Git content. `uploaded` means stored and read back; `checked` and `integrated` require separate exact evidence.
 
 The runner exports exact Git blobs without `.git`, then runs a pinned image as nonroot with read-only source, no network/server credentials, limited resources and disposable DB storage. The coordinator rechecks access/key/policy, invalidates stale checks/approvals, conditionally updates target and recovers lost receipts. Server-generated results are labeled server provenance; they do not claim an agent signature or physical human review.
 

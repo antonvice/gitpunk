@@ -1,0 +1,3 @@
+#!/usr/bin/env node
+import { remoteHelper } from '../remote-helper.js';
+remoteHelper().catch(() => { process.stderr.write('Gitpunk object fetch failed or exceeded its operation budget.\n'); process.exitCode = 1; });

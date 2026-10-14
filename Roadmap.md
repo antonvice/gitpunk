@@ -8,7 +8,7 @@ Signed intents, path policy, automatic text WIP, overlap acknowledgement, durabl
 
 The scaling slice adds checkout-free file/tree/diff/ancestry/history/blame APIs, sparse agent workspaces, bounded immutable server/node caches, server commits from signed drafts, selected check sources and concurrent exact checks. [SCALING.md](SCALING.md) records the matched Git baselines and remaining limits.
 
-The separate Workers/Artifacts bridge passed real push/clone, fork isolation, binary read-back and token revocation. The local collaboration server still uses SQLite and a bare Git store. Scripted MCP clients prove the workflow; real model execution is unverified.
+The separate Workers/Artifacts bridge passed real push/clone, fork isolation, binary read-back and token revocation. The optional R2/DO backend removes the full bare Git mirror: immutable objects, direct source reads, batched disposable Git inputs and recoverable conditional heads work in local workerd. Collaboration/auth remain on one SQLite gateway. Scripted MCP clients prove the workflow; real model execution is unverified.
 
 ## Next steps, in order
 
@@ -20,11 +20,13 @@ The separate Workers/Artifacts bridge passed real push/clone, fork isolation, bi
 | 4. Private pilot | Repo creation, team invites, owner review; install MCP and intercept managed write tools | Two invited users finish a task without editing private JSON; pre-write checks run automatically and managed agents cannot write protected files. |
 | 5. Hosted service | Workers API/UI, Durable Object branch ordering, Artifacts Git, D1/R2 only where needed, authenticated Kafka gateway | Two machines pass the existing flow, offline replay and stale-target tests within an approved monthly budget. |
 | 6. Reliable product | Backups/restore, quotas, retention, pagination, audit/export and Git history refs for portable provenance | Restore recovers accepted work; a long-running repo stays bounded; manifests survive ordinary Git history operations. |
-| 7. Agent-scale backend | Distributed immutable storage behind the source API, regional cache tiers, isolated reader replicas, runner pools and path-history indexes | A 100 GB history / 25 GB worktree fixture passes reads, writes, failures and revocation under measured sustained demand. Prove 30,000 merges/day and safe overload before claiming Anthropic-scale readiness. |
+| 7. Agent-scale backend | R2 objects/DO heads implemented; next: cloud proof, regional readers, runner pools, large objects and path-history indexes | Test representative dense 100 GB history / 25 GB worktrees, sustained 30,000 checked merges/day, regional failures, revocation and overload. Local synthetic volume and short throughput trials do not close production qualification. |
 
 Steps 1 and 2 form the submission gate. Step 4 is the first usable private product. Step 5 makes it a hosted product. There is no production deployment or agent-sandbox claim today.
 
-Step 7 is a separate scale gate. The local server retains a complete bare Git repository and one SQLite coordinator. Client caches and concurrent checks reduce work; they do not turn this store into a distributed backend. A single Artifacts bridge test is also insufficient evidence of that scale.
+Step 7 is a separate scale gate. The R2/DO option avoids a complete server Git copy; its adapter and native Git helper are tested in the real local runtime. The gateway remains a single authority and checks run on this Mac. [Backend limits](server/cloudflare/OBJECTS.md) and [measurements](SCALING.md) define the remaining qualification. A single Artifacts bridge test is insufficient evidence of production scale.
+
+The local large trial passed: 100 GiB logical history/25 GiB worktree, 1 GiB dense data, 2,053 initial commits and 128 real checked integrations in 104.31 seconds. Physical R2 storage was 1.182 GB. This closes the synthetic local volume test; live cloud, representative dense history and daily production demand remain gates.
 
 ## Principles
 

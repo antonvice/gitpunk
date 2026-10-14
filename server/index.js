@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { WorkRequest, CheckpointInput, RespondInput, GitUpload, CommitUploadEnvelope, SignedEnvelope, ServerCommit, SourceQuery, CheckPolicy, ProtocolError, canonicalJson, generateKeyPair, verifyEnvelope } from '../shared/index.js';
 import { createOutboxDispatcher } from './kafka.js';
 import { createGitStore } from './git-store.js';
+import { createObjectStore } from './object-store.js';
 import { createCoordinator } from './coordinator.js';
 import { serveBoard } from './board.js';
 import { createHumanAuth } from './human-auth.js';
@@ -61,7 +62,7 @@ export async function readOidcConfig(file) {
   finally { await handle?.close(); }
 }
 
-export async function createGitpunkServer({ dataDir = '.local/server', port = 8787, kafkaBrokers = [], bootstrap = false, leaseMs = 30_000, gitSource, checkPolicy, runner, oidcConfig } = {}) {
+export async function createGitpunkServer({ dataDir = '.local/server', port = 8787, kafkaBrokers = [], bootstrap = false, leaseMs = 30_000, gitSource, objectConfig, checkPolicy, runner, oidcConfig } = {}) {
   dataDir = path.resolve(dataDir);
   if (dataDir.split(path.sep).includes('.git')) throw new Error('Server state must be outside .git.');
   await mkdir(dataDir, { recursive: true, mode: 0o700 });
@@ -73,7 +74,8 @@ export async function createGitpunkServer({ dataDir = '.local/server', port = 87
   const dispatcher = createOutboxDispatcher(db, { brokers: kafkaBrokers });
   let fixture;
   if (bootstrap) fixture = await seed(db, dataDir);
-  const gitStore = await createGitStore({ dataDir, source: gitSource, db });
+  if (gitSource && objectConfig) throw new Error('Choose local Git or the object backend.');
+  const gitStore = objectConfig ? await createObjectStore({ dataDir, file: objectConfig, db }) : await createGitStore({ dataDir, source: gitSource, db });
   // Backfill accepted history once per old upload; a lost migration resumes by commit ID.
   if (gitStore) for (const row of db.prepare("SELECT u.* FROM uploads u LEFT JOIN git_commits c ON c.repo_id=u.repo_id AND c.commit_id=u.commit_id WHERE u.state='uploaded' AND c.commit_id IS NULL").all()) {
     const commits = await gitStore.history(parsed(row.data).base_commit, row.commit_id);
@@ -168,6 +170,7 @@ export async function createGitpunkServer({ dataDir = '.local/server', port = 87
     const schema = route === 'work' ? WorkRequest : route === 'checkpoints' ? CheckpointInput : RespondInput;
     const input = validate(schema, body.payload);
     const requestHash = digest(canonicalJson({ repoId, route, run_id: auth.id, payload: body.payload }));
+    const approvalTarget = input.action === 'approve' && gitStore ? await gitStore.readRef('refs/heads/main') : undefined;
     return transaction(db, () => {
       // Upload/signature verification yields; privileges must still hold at admission.
       auth = authenticate(request, repoId, true);
@@ -177,7 +180,7 @@ export async function createGitpunkServer({ dataDir = '.local/server', port = 87
       let result;
       if (route === 'work') result = work(auth, body, input, repoId);
       else if (route === 'checkpoints') result = checkpoint(auth, body, input, repoId);
-      else result = respond(auth, body, input, repoId);
+      else result = respond(auth, body, input, repoId, approvalTarget);
       db.prepare('INSERT INTO requests(id,hash,response) VALUES(?,?,?)').run(body.event_id, requestHash, JSON.stringify(result));
       return result;
     });
@@ -248,7 +251,7 @@ export async function createGitpunkServer({ dataDir = '.local/server', port = 87
     if (prior) { if (prior.hash !== requestHash) fail('idempotency_conflict', 'Request ID was reused.', 409); return parsed(prior.response); }
     const pending = uploadTasks.get(body.event_id);
     if (pending) { if (pending.hash !== requestHash) fail('idempotency_conflict', 'Request ID was reused.', 409); return pending.promise; }
-    const task = (async () => {
+    const task = (gitStore.use ?? (action => action()))(async () => {
       const intent = writableIntent(auth, input.intent_id, input.intent_revision);
       if (intent.base_commit !== input.base_commit || intent.branch !== input.branch || intent.workspace_id !== input.workspace_id) fail('base_mismatch', 'Commit must match the declared intent.', 409);
       if (input.branch !== gitStore.config.branch) fail('unsupported_target', 'Unsupported canonical branch.', 409);
@@ -273,10 +276,10 @@ export async function createGitpunkServer({ dataDir = '.local/server', port = 87
       db.prepare('INSERT OR IGNORE INTO source_requests(id,hash) VALUES(?,?)').run(body.event_id, requestHash);
       const ref = `refs/gitpunk/runs/${auth.id}/${body.event_id}`;
       const commit = await gitStore.readRef(ref).catch(() => null) || await sourceStore.commit(input.base_commit, checkpoints, input.message, body.event_id);
-      const actual = await gitStore.changes(input.base_commit, commit);
+      const storedRef = await gitStore.recordCreated(commit, { eventId: body.event_id, runId: auth.id });
+      const actual = await gitStore.changes(input.base_commit, commit, checkpoints.map(item => item.path));
       if (!actual.length || actual.length !== checkpoints.length || actual.some(file => !checkpoints.some(item => item.path === file.path && item.base_hash === file.base_hash && item.result_hash === file.result_hash))) fail('manifest_mismatch', 'Created commit differs from the pinned drafts.', 409);
       for (const file of actual) inspectCandidate({ data: JSON.stringify({ manifest: input }) }, auth, file);
-      const storedRef = await gitStore.recordCreated(commit, { eventId: body.event_id, runId: auth.id });
       return transaction(db, () => {
         auth = authenticate(request, repoId, true);
         if (auth.public_key !== key || auth.scope !== scope) fail('scope_changed', 'Authority changed while creating the commit.', 403);
@@ -292,7 +295,7 @@ export async function createGitpunkServer({ dataDir = '.local/server', port = 87
         db.prepare('INSERT INTO requests(id,hash,response) VALUES(?,?,?)').run(data.id, requestHash, JSON.stringify(response));
         return response;
       });
-    })();
+    });
     uploadTasks.set(body.event_id, { hash: requestHash, promise: task });
     try { return await task; } finally { uploadTasks.delete(body.event_id); }
   }
@@ -346,10 +349,10 @@ export async function createGitpunkServer({ dataDir = '.local/server', port = 87
     const event = emit(auth, envelope, repoId, intent.branch, 'draft.changed', { id, intent_id: intent.id, intent_revision: intent.revision, path: input.path, operation: input.operation, result_hash: input.result_hash, base_hash: input.base_hash });
     return { state: 'draft', checkpoint: data, checkpoint_id: id, blockers: [], next_actions: [], event };
   }
-  function respond(auth, envelope, input, repoId) {
+  function respond(auth, envelope, input, repoId, approvalTarget) {
     let branch = 'main', data, type;
     if (input.action === 'approve' || input.action === 'retry_check') {
-      data = input.action === 'approve' ? coordinator.approve(auth, envelope, input) : coordinator.retry(auth, input);
+      data = input.action === 'approve' ? coordinator.approve(auth, envelope, input, approvalTarget) : coordinator.retry(auth, input);
       branch = parsed(db.prepare('SELECT data FROM uploads WHERE id=?').get(input.submission_id).data).branch;
       type = input.action === 'approve' ? 'integration.approved' : 'checks.requeued';
     } else if (input.action === 'ack') {
@@ -515,7 +518,7 @@ export async function createGitpunkServer({ dataDir = '.local/server', port = 87
         const blockers = intents.filter(intent => intent.run_id === auth.id && ['active','blocked','lease_expired'].includes(intent.state)).flatMap(intent => intent.state === 'lease_expired' ? [{ type: 'lease_expired', intent_id: intent.id }] : peerOverlaps(intent.id, repoId, branch, intent.files).map(peer => ({ ...peer, type: 'overlap', intent_id: intent.id, peer_intent_id: peer.intent_id, peer_revision: peer.revision })));
         const write_permissions = Object.fromEntries(intents.filter(intent => intent.run_id === auth.id && ['active','blocked','lease_expired'].includes(intent.state)).flatMap(intent => intent.files.map(file => [file, auth.role === 'reader' ? [] : ['create','modify','delete','rename'].filter(operation => { try { checkScope(auth, file, operation); return true; } catch (error) { if (error instanceof ProtocolError) return false; throw error; } })])));
         const gitInfo = { configured: !!gitStore && repoId === 'demo' && branch === gitStore.config.branch };
-        if (gitInfo.configured) { const target = gitStore.readRefSync('refs/heads/main'); Object.assign(gitInfo, { target, target_commit: target, target_ref: 'refs/heads/main', base_commit: gitStore.config.base_commit, branch: gitStore.config.branch }); }
+        if (gitInfo.configured) { const target = await gitStore.readRef('refs/heads/main'); authenticate(request, repoId); Object.assign(gitInfo, { target, target_commit: target, target_ref: 'refs/heads/main', base_commit: gitStore.config.base_commit, branch: gitStore.config.branch, backend: gitStore.distributed ? 'r2' : 'local-git' }); }
         data = { state: blockers.length ? 'blocked' : 'connected', mode: 'local-development', run_id: auth.id, actor: actor(auth.id), branch, intents, claims, checkpoints, decisions, handoffs, uploads, blockers, write_permissions, next_actions: blockers.length ? ['respond:overlap'] : [], events_cursor: Number(db.prepare('SELECT COALESCE(MAX(seq),0) AS n FROM events WHERE repo_id=? AND branch=?').get(repoId, branch).n), git: gitInfo, kafka: dispatcher.status(), integration: coordinator.status({ repoId, branch }) };
       } else fail('method_not_allowed', 'Method is not supported.', 405);
       response.end(JSON.stringify({ ok: true, data, error: null }));
@@ -534,7 +537,7 @@ export async function createGitpunkServer({ dataDir = '.local/server', port = 87
       const address = server.address(), endpoint = `http://127.0.0.1:${address.port}`;
       if (fixture) { fixture.endpoint = endpoint; await writeFile(path.join(dataDir, 'fixture.json'), JSON.stringify(fixture, null, 2) + '\n', { mode: 0o600 }); }
       await dispatcher.start();
-      coordinator.start();
+      await coordinator.start();
       return { endpoint, port: address.port, fixture_path: fixture ? path.join(dataDir, 'fixture.json') : undefined };
     },
     address() { const address = server.address(); return address && `http://127.0.0.1:${address.port}`; },
@@ -571,7 +574,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const option = (name, fallback) => args.find(value => value.startsWith(`--${name}=`))?.slice(name.length + 3) ?? (args.includes(`--${name}`) ? args[args.indexOf(`--${name}`) + 1] : fallback);
   const checkConfig = option('check-config');
   const oidcFile = option('oidc-config');
-  const app = await createGitpunkServer({ dataDir: option('data-dir', '.local/server'), port: Number(option('port', 8787)), bootstrap: args.includes('--bootstrap'), gitSource: option('git-source'), checkPolicy: checkConfig ? parsed(await readFile(checkConfig, 'utf8')) : undefined, oidcConfig: oidcFile ? await readOidcConfig(oidcFile) : undefined, kafkaBrokers: (option('kafka-brokers', '')).split(',').filter(Boolean) });
+  const app = await createGitpunkServer({ dataDir: option('data-dir', '.local/server'), port: Number(option('port', 8787)), bootstrap: args.includes('--bootstrap'), gitSource: option('git-source'), objectConfig: option('object-config'), checkPolicy: checkConfig ? parsed(await readFile(checkConfig, 'utf8')) : undefined, oidcConfig: oidcFile ? await readOidcConfig(oidcFile) : undefined, kafkaBrokers: (option('kafka-brokers', '')).split(',').filter(Boolean) });
   const started = await app.start();
   process.stdout.write(JSON.stringify({ ...started, mode: 'local-development' }) + '\n');
   for (const signal of ['SIGTERM','SIGINT']) process.once(signal, async () => { await app.stop(); process.exit(0); });

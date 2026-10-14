@@ -8,13 +8,17 @@ import { createGitpunkServer } from '../server/index.js';
 import { GitpunkClient } from '../client/index.js';
 import { git, head } from '../client/git.js';
 import { createWorkspaces } from './git-fixture.js';
+import { localObjects } from './local-objects.js';
+import { importObjects } from './import-objects.js';
+import { objectClient } from '../server/object-client.js';
 
 const run = promisify(execFile);
 const exists = async file => { try { await access(file); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } };
 const privateJson = async (file, value) => { await writeFile(file, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 }); await chmod(file, 0o600); };
 const project = fileURLToPath(new URL('../', import.meta.url));
 
-export async function startMvp({ root = '.local/mvp', port = 8787, source, kafkaBrokers = [], checks = true, runner, remote = false } = {}) {
+export async function startMvp({ root = '.local/mvp', port = 8787, source, kafkaBrokers = [], checks = true, runner, remote = false, objects = false } = {}) {
+  remote ||= objects;
   root = resolve(root);
   await mkdir(root, { recursive: true, mode: 0o700 });
   await chmod(root, 0o700);
@@ -32,7 +36,16 @@ export async function startMvp({ root = '.local/mvp', port = 8787, source, kafka
     await head(workspaces[name]);
   }
   const checkPolicy = checks ? JSON.parse(await readFile(new URL('../infra/checks.example.json', import.meta.url), 'utf8')) : undefined;
-  const server = await createGitpunkServer({ dataDir: join(root, 'server'), bootstrap: true, port, gitSource: workspaces.source, kafkaBrokers, checkPolicy, runner });
+  let objectRuntime, objectConfig, server;
+  try {
+    if (objects) {
+      objectRuntime = await localObjects(join(root, 'objects'));
+      if (!await objectClient(objectRuntime).head()) await importObjects(workspaces.source, objectClient(objectRuntime));
+      objectConfig = join(root, 'objects.json');
+      await privateJson(objectConfig, { endpoint: objectRuntime.endpoint, token: objectRuntime.token, repo: 'demo', base: await head(workspaces.source) });
+    }
+    server = await createGitpunkServer({ dataDir: join(root, 'server'), bootstrap: true, port, ...(objects ? { objectConfig } : { gitSource: workspaces.source }), kafkaBrokers, checkPolicy, runner });
+  } catch (error) { await objectRuntime?.stop(); throw error; }
   const clients = {}, sync = [], abort = new AbortController();
   let stopped = false;
   async function stop() {
@@ -45,6 +58,7 @@ export async function startMvp({ root = '.local/mvp', port = 8787, source, kafka
       client.close();
     }
     await server.stop();
+    await objectRuntime?.stop();
   }
   try {
     const started = await server.start();
@@ -74,7 +88,7 @@ export async function startMvp({ root = '.local/mvp', port = 8787, source, kafka
         }
       })());
     }
-    const receipt = { mode: 'local-development', remote, endpoint: started.endpoint, board: `${started.endpoint}/board`, root, workspaces, profiles, board_profile: boardProfile, checks: checks ? 'pinned Docker; manual exact approval' : 'disabled; uploads stay unverified', kafka: kafkaBrokers.length ? 'configured; delivery visible in /health' : 'disabled; durable cursor polling remains available', cloud_writes: false, agent_models: 'Bring an MCP-capable coding agent; no model credentials are required by Gitpunk.' };
+    const receipt = { mode: 'local-development', remote, backend: objects ? 'R2/DO in local workerd' : 'local-git', endpoint: started.endpoint, board: `${started.endpoint}/board`, root, workspaces, profiles, board_profile: boardProfile, checks: checks ? 'pinned Docker; manual exact approval' : 'disabled; uploads stay unverified', kafka: kafkaBrokers.length ? 'configured; delivery visible in /health' : 'disabled; durable cursor polling remains available', cloud_writes: false, agent_models: 'Bring an MCP-capable coding agent; no model credentials are required by Gitpunk.' };
     await privateJson(join(root, 'runtime.json'), { ...receipt, pid: process.pid, started_at: new Date().toISOString() });
     return { receipt, server, clients, stop };
   } catch (error) { await stop(); throw error; }
@@ -82,9 +96,9 @@ export async function startMvp({ root = '.local/mvp', port = 8787, source, kafka
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    const { values } = parseArgs({ options: { 'data-dir': { type: 'string' }, port: { type: 'string' }, source: { type: 'string' }, remote: { type: 'boolean' }, 'no-kafka': { type: 'boolean' }, 'no-checks': { type: 'boolean' } } });
+    const { values } = parseArgs({ options: { 'data-dir': { type: 'string' }, port: { type: 'string' }, source: { type: 'string' }, remote: { type: 'boolean' }, objects: { type: 'boolean' }, 'no-kafka': { type: 'boolean' }, 'no-checks': { type: 'boolean' } } });
     if (!values['no-kafka']) await run('docker', ['compose', '-f', join(project, 'infra/compose.yaml'), 'up', '-d'], { timeout: 30_000 });
-    const app = await startMvp({ root: values['data-dir'] || (values.remote ? '.local/mvp-remote' : undefined), port: Number(values.port || 8787), source: values.source, remote: values.remote, kafkaBrokers: values['no-kafka'] ? [] : ['127.0.0.1:9092'], checks: !values['no-checks'] });
+    const app = await startMvp({ root: values['data-dir'] || (values.objects ? '.local/mvp-objects' : values.remote ? '.local/mvp-remote' : undefined), port: Number(values.port || 8787), source: values.source, remote: values.remote, objects: values.objects, kafkaBrokers: values['no-kafka'] ? [] : ['127.0.0.1:9092'], checks: !values['no-checks'] });
     process.stdout.write(JSON.stringify(app.receipt, null, 2) + '\n');
     for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, async () => { await app.stop(); process.exit(0); });
   } catch (error) { process.stderr.write(`Gitpunk startup failed: ${error.message}\n`); process.exitCode = 1; }

@@ -1,0 +1,81 @@
+{
+  "started_at": "2026-10-14T18:30:24.648Z",
+  "runtime": "local workerd / R2 / SQLite Durable Objects",
+  "cloud_writes": false,
+  "llm_calls": 0,
+  "fixture": {
+    "logical_history_bytes": 107374184348,
+    "logical_worktree_bytes": 26843547558,
+    "dense_blob_bytes": 1073741824,
+    "objects": 53394,
+    "compressible_fixture": true,
+    "history_commits": 2053,
+    "compressed_r2_object_bytes": 1182002021,
+    "physical_runtime_bytes": 1203256005,
+    "base": "98f1e7d5efbe588bc7323364120a92358026585c"
+  },
+  "evidence": {
+    "selected_reads": {
+      "count": 32,
+      "p50_ms": 1.7920419999863952,
+      "p95_ms": 2.504666000022553,
+      "sha256": "a06106e01c0ed5a953720fe62093cdd5cc2cbcc2144ca6a260e43a2393c81c0f",
+      "backend": {
+        "active": 0,
+        "peak_active": 1,
+        "operations": 0,
+        "downloaded_bytes": 448,
+        "downloaded_objects": 3,
+        "peak_cache_bytes": 0,
+        "retained_git_bytes": 0,
+        "object_cache": {
+          "hits": 0,
+          "misses": 3,
+          "bytes": 448,
+          "entries": 3,
+          "pending": 0
+        }
+      }
+    },
+    "checked_integrations": {
+      "jobs": 128,
+      "elapsed_seconds": 104.31149141700007,
+      "observed_per_second": 1.2270939496809774,
+      "equivalent_per_day": 106020.91725243645,
+      "includes": "Signed intent, draft, server commit, real Docker check and DO admission; short local trial, not a 24-hour capacity claim.",
+      "backend": {
+        "active": 0,
+        "peak_active": 6,
+        "operations": 512,
+        "downloaded_bytes": 1450040,
+        "downloaded_objects": 1026,
+        "peak_cache_bytes": 43445,
+        "retained_git_bytes": 0,
+        "object_cache": {
+          "hits": 22011,
+          "misses": 1026,
+          "bytes": 1450000,
+          "entries": 1024,
+          "pending": 0
+        }
+      },
+      "peak_checks": 3
+    },
+    "branch_updates": {
+      "updates": 27575,
+      "elapsed_seconds": 120.001221916,
+      "p50_ms": 3.5009159999899566,
+      "p95_ms": 7.059208000078797,
+      "includes": "Object PUT, durable conditional head update and receipt read; excludes merge computation and CI."
+    },
+    "source_cache": "SHA-256 verified"
+  },
+  "completed_at": "2026-10-14T18:45:50.695Z",
+  "state": "passed",
+  "measurement_notes": [
+    "All storage and execution were local on one Mac; no paid Cloudflare or model calls.",
+    "History and worktree sizes count uncompressed Git bytes; most blobs are compressible. Dense bytes and physical storage are separate.",
+    "Automatic approval and a synthetic syntax/checksum Docker contract; this is not representative production CI or a 24-hour capacity proof.",
+    "The throughput run used a 1024-entry object cache and uncached object-size HEAD reads. Later changes cache those sizes and raise the entry cap to 8192, preserving the 32 MiB byte cap."
+  ]
+}

@@ -4,6 +4,8 @@ Target server design. The local HTTP/SQLite prototype implements signed collabor
 
 The local scaling slice is implemented: scoped source queries, bounded immutable cache, accepted-history index, server commits from signed drafts, selected check sources and concurrent candidate checks. [Measurements and boundaries](../SCALING.md). The production design below is a target, not a deployed distributed service.
 
+The optional [R2/DO backend](cloudflare/OBJECTS.md) is implemented and tested in local workerd. R2 holds compressed Git objects; DO holds canonical heads and durable CAS receipts. A gateway caches immutable bytes and batches selected objects into temporary promisor repositories. Direct source reads need no Git process. Collaboration/auth and Docker execution remain on the Mac.
+
 ## Responsibility
 
 Cloudflare stores Git and runs our API. We implement identity, access, intents, WIP, pub/sub and integration.
@@ -155,7 +157,7 @@ Local Kafka configuration lives in `infra/compose.yaml`. Worker binding template
 
 [Internal Artifacts bridge](cloudflare/README.md): live create/fork/push/clone and exact binary reads passed. Read-only/fork permissions and token revocation were verified. The endpoint is disabled after testing; the full cloud coordinator remains planned.
 
-For larger repositories, keep the source API stable and move immutable objects and derived history behind scalable storage/cache readers. Workers/Artifacts do not automatically distribute the local SQLite log, check runners or bare Git mirror. Validate large-history load and outage recovery before claiming the [scale gate](../Roadmap.md).
+For larger repositories, the R2 adapter removes the full bare Git mirror. Regional readers, path-history indexes, large-object support and gateway/runner replication remain work. Workers/Artifacts do not distribute the SQLite collaboration log or runners automatically. Production demand and failure qualification remain the [scale gate](../Roadmap.md).
 
 ## Sources
 
