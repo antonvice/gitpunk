@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, writeFile, rm, rename, access, lstat } from 'node:fs/promises';
 import path from 'node:path';
 import { ProtocolError, canonicalJson, MAX_BUNDLE_BYTES } from '../shared/index.js';
+import { readBlobs } from './git-objects.js';
 
 const execute = promisify(execFile);
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -47,10 +48,8 @@ export async function createGitStore({ dataDir, source, db }) {
   const bundles = path.join(dataDir, 'bundles');
   await mkdir(bundles, { recursive: true, mode: 0o700 });
   async function knownBase(base) {
+    if (db.prepare('SELECT 1 FROM git_commits WHERE repo_id=? AND commit_id=?').get(config.repo_id, base)) return true;
     try { await storedGit(directory, 'merge-base', '--is-ancestor', base, 'refs/heads/main'); return true; } catch {}
-    for (const row of db.prepare("SELECT commit_id FROM uploads WHERE repo_id='demo' AND state='uploaded'").all()) {
-      try { await storedGit(directory, 'merge-base', '--is-ancestor', base, row.commit_id); return true; } catch {}
-    }
     return false;
   }
   async function changes(repo, base, commit) {
@@ -64,17 +63,45 @@ export async function createGitStore({ dataDir, source, db }) {
       if (!status || !['A','M','D','T'].includes(status)) deny('unsupported_git_change', 'Unsupported Git change type.');
       const oldPresent = oldMode !== '000000', newPresent = newMode !== '000000';
       if ([oldPresent && oldMode, newPresent && newMode].some(mode => mode && !['100644','100755'].includes(mode))) deny('unsupported_git_mode', 'Symlinks and submodules are not accepted.', 403, { path: parts[i + 1] });
-      const baseBytes = oldPresent ? await storedGit(repo, 'cat-file', 'blob', oldId) : null;
-      const resultBytes = newPresent ? await storedGit(repo, 'cat-file', 'blob', newId) : null;
-      result.push({ path: parts[i + 1], operation: !oldPresent ? 'create' : !newPresent ? 'delete' : 'modify', base_hash: baseBytes === null ? null : hash(baseBytes), result_hash: resultBytes === null ? null : hash(resultBytes), base_mode: oldPresent ? oldMode : null, result_mode: newPresent ? newMode : null, baseBytes, resultBytes });
+      result.push({ path: parts[i + 1], operation: !oldPresent ? 'create' : !newPresent ? 'delete' : 'modify', oldId: oldPresent ? oldId : null, newId: newPresent ? newId : null, base_mode: oldPresent ? oldMode : null, result_mode: newPresent ? newMode : null });
     }
-    return result;
+    const blobs = await readBlobs(repo, result.flatMap(file => [file.oldId, file.newId].filter(Boolean)), 20 * 1024 * 1024);
+    return result.map(({ oldId, newId, ...file }) => {
+      const baseBytes = oldId ? blobs.get(oldId) : null, resultBytes = newId ? blobs.get(newId) : null;
+      return { ...file, base_hash: baseBytes === null ? null : hash(baseBytes), result_hash: resultBytes === null ? null : hash(resultBytes), baseBytes, resultBytes };
+    });
   }
   let targetCache, targetTask;
   return {
-    directory, config,
+    directory, config, knownBase,
+    history: async (base, commit) => (await text(directory, 'rev-list', commit, `^${base}`)).split('\n').filter(Boolean),
+    changes: (base, commit) => changes(directory, base, commit),
+    async recordCreated(commit, { eventId, runId }) {
+      const ref = `refs/gitpunk/runs/${runId}/${eventId}`;
+      const existing = await text(directory, 'rev-parse', '--verify', ref).catch(() => null);
+      if (existing && existing !== commit) deny('idempotency_conflict', 'Request already names another commit.', 409);
+      if (!existing) await storedGit(directory, 'update-ref', ref, commit, '0'.repeat(config.object_format === 'sha1' ? 40 : 64));
+      return ref;
+    },
+    async exportCreated(id, base, commit) {
+      const file = path.join(bundles, `${id}.bundle`);
+      if (!await exists(file)) {
+        const temporary = await mkdtemp(path.join(dataDir, 'export-'));
+        const ref = `refs/gitpunk/exports/${randomUUID()}`;
+        try {
+          const created = path.join(temporary, 'commit.bundle');
+          await storedGit(directory, 'update-ref', ref, commit);
+          await storedGit(directory, 'bundle', 'create', created, ref, `^${base}`);
+          if ((await lstat(created)).size > MAX_BUNDLE_BYTES) deny('bundle_too_large', 'Use the source API for this commit; its legacy bundle exceeds 4 MiB.', 413);
+          await rename(created, file);
+        } finally { await storedGit(directory, 'update-ref', '-d', ref, commit).catch(() => {}); await rm(temporary, { recursive: true, force: true }); }
+      }
+      const bytes = await readFile(file);
+      return { bundle_content: bytes.toString('base64'), bundle_hash: hash(bytes) };
+    },
     async targetSnapshot(withBundle = false) {
       const commit = await text(directory, 'rev-parse', 'refs/heads/main');
+      if (!withBundle) return { origin: 'server', branch: config.branch, base_commit: config.base_commit, commit };
       if (targetCache?.commit !== commit) {
         if (!targetTask || targetTask.commit !== commit) {
           const promise = (async () => {
@@ -171,7 +198,7 @@ export async function createGitStore({ dataDir, source, db }) {
         if (existing && existing !== input.commit) deny('idempotency_conflict', 'Immutable upload ref already names different code.', 409);
         await storedGit(directory, 'fetch', '--no-tags', '--no-write-fetch-head', temporary, `${input.commit}:${ref}`);
         if (await text(directory, 'rev-parse', ref) !== input.commit) throw new Error('Uploaded ref read-back failed.');
-        return { ref, bundle_path: destination, files: actual, commits: commits.length };
+        return { ref, bundle_path: destination, files: actual, commits: commits.length, commit_ids: commits };
       } finally { await rm(temporary, { recursive: true, force: true }); }
     },
     async readBundle(id) { return (await readFile(path.join(bundles, `${id}.bundle`))).toString('base64'); },

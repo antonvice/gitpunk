@@ -105,16 +105,22 @@ export async function snapshot(workspace, path, maxBytes = 256 * 1024) {
     } finally { await file.close(); }
   } catch (error) { if (error.code === 'ENOENT') return { content: null }; throw error; }
 }
-export async function restoreCheckpoints(workspace, checkpoints, branchName) {
+export async function restoreCheckpoints(workspace, checkpoints, branchName, { remote = false } = {}) {
   if (!checkpoints.length || new Set(checkpoints.map(item => item.base_commit)).size !== 1) throw new Error('Handoff requires checkpoints with one common base commit.');
   if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(checkpoints[0].base_commit)) throw new Error('Handoff base must be an exact Git commit ID.');
-  const dirty = await git(workspace, 'status', '--porcelain', '--untracked-files=all');
-  if (dirty) throw new Error('Handoff import requires a clean workspace; commit or stash local changes first.');
-  await git(workspace, 'cat-file', '-e', `${checkpoints[0].base_commit}^{commit}`);
+  if (remote) {
+    for (const checkpoint of checkpoints) {
+      const current = await snapshot(workspace, checkpoint.path);
+      if (current.content !== null && await hashBytes(Buffer.from(current.content)) !== checkpoint.base_hash) throw new Error('Handoff import requires unchanged source files.');
+    }
+  } else {
+    if (await git(workspace, 'status', '--porcelain', '--untracked-files=all')) throw new Error('Handoff import requires a clean workspace; commit or stash local changes first.');
+    await git(workspace, 'cat-file', '-e', `${checkpoints[0].base_commit}^{commit}`);
+  }
   for (const checkpoint of checkpoints) await safePath(workspace, checkpoint.path);
-  const previous = await git(workspace, 'symbolic-ref', '--short', 'HEAD');
+  const previous = remote ? null : await git(workspace, 'symbolic-ref', '--short', 'HEAD');
   const staged = [], originals = new Map(), applied = [];
-  await managedGit(workspace, 'switch', '-c', branchName, checkpoints[0].base_commit);
+  if (!remote) await managedGit(workspace, 'switch', '-c', branchName, checkpoints[0].base_commit);
   try {
     // Recheck after switching: the base tree may introduce a symlink parent.
     for (const checkpoint of checkpoints) await safePath(workspace, checkpoint.path);
@@ -124,7 +130,7 @@ export async function restoreCheckpoints(workspace, checkpoints, branchName) {
       try {
         const stat = await lstat(full);
         if (!stat.isFile()) throw new Error(`Handoff path is not a regular file: ${checkpoint.path}`);
-        original = { mode: stat.mode };
+        original = { mode: stat.mode, ...(remote ? { bytes: await readFile(full) } : {}) };
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
       originals.set(checkpoint.path, original);
       if (checkpoint.content !== null) {
@@ -146,8 +152,11 @@ export async function restoreCheckpoints(workspace, checkpoints, branchName) {
       for (const item of staged) if (item.temporary) await unlink(item.temporary).catch(cause => { if (cause.code !== 'ENOENT') throw cause; });
       const tracked = applied.filter(item => originals.get(item.checkpoint.path)).map(item => item.checkpoint.path);
       for (const item of applied) if (!originals.get(item.checkpoint.path)) await unlink(item.full).catch(cause => { if (cause.code !== 'ENOENT') throw cause; });
-      if (tracked.length) await managedGit(workspace, 'restore', '--source', checkpoints[0].base_commit, '--worktree', '--', ...tracked);
-      await managedGit(workspace, 'switch', previous);
+      if (remote) { for (const path of tracked) await writeFile(await safePath(workspace, path), originals.get(path).bytes, { mode: originals.get(path).mode }); }
+      else {
+        if (tracked.length) await managedGit(workspace, 'restore', '--source', checkpoints[0].base_commit, '--worktree', '--', ...tracked);
+        await managedGit(workspace, 'switch', previous);
+      }
     } catch { throw new Error(`Handoff failed and rollback could not finish; inspect ${branchName}. Original error: ${error.message}`); }
     throw error;
   }

@@ -28,6 +28,25 @@ export const SafePath = z.string().min(1).max(500).refine(value =>
   value.split('/').every(part => part && part !== '.' && part !== '..' && part.toLowerCase() !== '.git'),
   'Use a repository-relative path without traversal or .git');
 
+const concretePath = SafePath.refine(value => !/[*?\[\]]/.test(value), 'Use a concrete path');
+const paths = z.array(concretePath).min(1).max(128).refine(value => new Set(value).size === value.length, 'Duplicate paths');
+export const SourceQuery = z.discriminatedUnion('action', [
+  z.object({ action: z.literal('file'), commit, path: concretePath }).strict(),
+  z.object({ action: z.literal('snapshot'), commit, paths }).strict(),
+  z.object({ action: z.literal('tree'), commit, path: concretePath.optional(), after: z.string().max(500).default(''), limit: z.number().int().min(1).max(256).default(128) }).strict(),
+  z.object({ action: z.literal('diff'), base: commit, commit, paths }).strict(),
+  z.object({ action: z.literal('compare'), base: commit, commit }).strict(),
+  z.object({ action: z.literal('history'), commit, path: concretePath, limit: z.number().int().min(1).max(100).default(20) }).strict(),
+  z.object({ action: z.literal('blame'), commit, path: concretePath, start: z.number().int().min(1).default(1), end: z.number().int().min(1).max(100_000).default(100) }).strict(),
+]);
+
+export const ServerCommit = z.object({
+  action: z.literal('commit'), intent_id: id, intent_revision: revision,
+  base_commit: commit, branch: branch.default('main'), workspace_id: id,
+  checkpoint_ids: z.array(id).min(1).max(128).refine(value => new Set(value).size === value.length, 'Duplicate checkpoints'),
+  message: z.string().trim().min(1).max(4000),
+}).strict();
+
 export const IntentInput = z.object({
   title: z.string().trim().min(1).max(160),
   type: z.enum(['feature', 'change', 'bugfix', 'refactor', 'docs', 'test', 'maintenance']),
@@ -114,6 +133,8 @@ export const CheckPolicy = z.object({
   pids_limit: z.number().int().min(8).max(512).default(64),
   max_output_bytes: z.number().int().min(1).max(1024 * 1024).default(65_536),
   max_source_bytes: z.number().int().min(1).max(64 * 1024 * 1024).default(16 * 1024 * 1024),
+  source_paths: z.array(concretePath).min(1).max(128).optional(),
+  check_concurrency: z.number().int().min(1).max(8).default(1),
   approval: z.enum(['manual', 'automatic']).default('manual'),
 }).strict();
 
@@ -142,6 +163,24 @@ export const SignedEnvelope = z.object({
   payload: z.json(),
   signature: z.string().regex(/^[A-Za-z0-9+/]{86}==$/),
 }).strict();
+
+/** The agent signs exact draft IDs; Gitpunk creates the Git commit and manifest. */
+export async function verifyServerCommit(proof) {
+  const request = SignedEnvelope.parse(proof.signed), input = ServerCommit.parse(request.payload);
+  if (!await verifyEnvelope(request, proof.public_key) || request.run_id !== proof.actor?.run_id) throw new Error('Invalid server-commit request signature.');
+  const manifest = GitUpload.parse(proof.manifest);
+  for (const key of ['intent_id', 'intent_revision', 'base_commit', 'branch', 'workspace_id']) if (input[key] !== manifest[key]) throw new Error('Server commit differs from the signed request.');
+  if (!Array.isArray(proof.checkpoints) || proof.checkpoints.length !== input.checkpoint_ids.length || manifest.files.length !== input.checkpoint_ids.length) throw new Error('Missing signed draft proofs.');
+  for (const draft of proof.checkpoints) {
+    const envelope = SignedEnvelope.parse(draft), item = CheckpointInput.parse(envelope.payload);
+    if (!input.checkpoint_ids.includes(envelope.event_id) || envelope.run_id !== request.run_id || !await verifyEnvelope(envelope, proof.public_key)) throw new Error('Invalid signed draft proof.');
+    for (const key of ['intent_id', 'intent_revision', 'base_commit', 'branch', 'workspace_id']) if (input[key] !== item[key]) throw new Error('Draft belongs to another intent.');
+    const file = manifest.files.find(file => file.path === item.path);
+    if (!file || file.operation !== item.operation || file.base_hash !== item.base_hash || file.result_hash !== item.result_hash || file.result_mode !== (item.content === null ? null : file.base_mode || '100644')) throw new Error('Created file differs from its signed draft.');
+  }
+  if (new Set(proof.checkpoints.map(item => item.event_id)).size !== input.checkpoint_ids.length || new Set(proof.checkpoints.map(item => item.payload.path)).size !== manifest.files.length) throw new Error('Duplicate draft proof.');
+  return manifest;
+}
 
 export const MAX_BUNDLE_BYTES = 4 * 1024 * 1024;
 export const MAX_BUNDLE_BASE64_LENGTH = Math.ceil(MAX_BUNDLE_BYTES / 3) * 4;

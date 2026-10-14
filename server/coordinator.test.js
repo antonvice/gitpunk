@@ -10,13 +10,13 @@ import { exampleIntent, canonicalJson, hashContent, hashBytes, signEnvelope } fr
 
 // These isolate coordinator state-machine tests. Actual Docker execution is tested separately.
 const policy = { image: `test@sha256:${'a'.repeat(64)}`, command: ['true'], approval: 'automatic' };
-async function setup(t, { approval = 'automatic', result = () => 'passed' } = {}) {
+async function setup(t, { approval = 'automatic', result = () => 'passed', check_concurrency = 1 } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'gitpunk-coordinator-'));
   const workspaces = await createWorkspaces(root);
   const dataDir = join(root, 'server');
   const calls = [];
-  const runner = async ({ candidate, policy }) => { calls.push(candidate); return { state: result(candidate, calls.length), candidate, image_digest: policy.image, policy_hash: await hashContent(canonicalJson(policy)), exit_code: 0, stdout: '', stderr: '', truncated: false }; };
-  let app = await createGitpunkServer({ dataDir, bootstrap: true, port: 0, gitSource: workspaces.source, checkPolicy: { ...policy, approval }, runner });
+  const runner = async ({ candidate, policy }) => { calls.push(candidate); const state = await result(candidate, calls.length); return { state, candidate, image_digest: policy.image, policy_hash: await hashContent(canonicalJson(policy)), exit_code: 0, stdout: '', stderr: '', truncated: false }; };
+  let app = await createGitpunkServer({ dataDir, bootstrap: true, port: 0, gitSource: workspaces.source, checkPolicy: { ...policy, approval, check_concurrency }, runner });
   await app.start();
   t.after(async () => { await app.stop(); await rm(root, { recursive: true, force: true }); });
   async function request(name, route, payload, attachment = {}) {
@@ -44,8 +44,50 @@ async function setup(t, { approval = 'automatic', result = () => 'passed' } = {}
     while (Date.now() < limit) { await app.coordinator.flush(); const status = app.coordinator.status(); if (predicate(status)) return status; await new Promise(resolve => setTimeout(resolve, 20)); }
     assert.fail(JSON.stringify(app.coordinator.status()));
   }
-  return { get app() { return app; }, request, submit, until, calls, workspaces, async restart() { await app.stop(); app = await createGitpunkServer({ dataDir, bootstrap: true, port: 0, gitSource: workspaces.source, checkPolicy: { ...policy, approval }, runner }); await app.start(); } };
+  return { get app() { return app; }, request, submit, until, calls, workspaces, async restart() { await app.stop(); app = await createGitpunkServer({ dataDir, bootstrap: true, port: 0, gitSource: workspaces.source, checkPolicy: { ...policy, approval, check_concurrency }, runner }); await app.start(); } };
 }
+
+for (const firstResult of ['passed', 'failed']) test(`concurrent checks finish out of order; a ${firstResult} prefix admits only exact code`, async t => {
+  let release;
+  const barrier = new Promise(resolve => { release = resolve; });
+  const env = await setup(t, { check_concurrency: 2, result: async (_candidate, n) => { if (n === 1) await barrier; return n === 1 ? firstResult : 'passed'; } });
+  let a, b, combined;
+  try {
+    a = await env.submit('alice', 'models.py', 'model = "prefix"\n');
+    b = await env.submit('bob', 'services.py', 'service = "suffix"\n');
+    combined = await env.until(status => status.submissions.find(row => row.id === b.id)?.state === 'awaiting_approval');
+    assert.equal(combined.submissions[0].state, 'checking');
+    assert.equal(combined.peak_checks, 2);
+    assert.equal(await env.app.gitStore.readRef('refs/heads/main'), env.app.gitStore.config.base_commit);
+    assert.equal(combined.checks[1].target, combined.checks[0].candidate);
+  } finally { release(); }
+  const status = await env.until(status => status.submissions.find(row => row.id === b.id)?.state === 'integrated');
+  const target = await env.app.gitStore.readRef('refs/heads/main');
+  assert.equal(await git(env.app.gitStore.directory, 'show', `${target}:services.py`), 'service = "suffix"');
+  if (firstResult === 'failed') {
+    assert.equal(status.checks.length, 3); assert.equal(status.checks[1].state, 'stale');
+    assert.ok(!(await git(env.app.gitStore.directory, 'show', `${target}:models.py`)).includes('prefix'));
+    assert.equal(status.checks[2].target, env.app.gitStore.config.base_commit);
+  } else {
+    assert.equal(status.checks.length, 2);
+    assert.equal(await git(env.app.gitStore.directory, 'show', `${target}:models.py`), 'model = "prefix"');
+    assert.deepEqual(status.operations.map(row => row.submission_id), [a.id, b.id]);
+  }
+});
+
+test('speculative passing checks preserve ordered manual approval', async t => {
+  const env = await setup(t, { check_concurrency: 2, approval: 'manual' });
+  const a = await env.submit('alice', 'models.py', 'model = "approved prefix"\n');
+  const b = await env.submit('bob', 'services.py', 'service = "approved suffix"\n');
+  const status = await env.until(status => status.submissions.length === 2 && status.submissions.every(row => row.state === 'awaiting_approval'));
+  const action = check => ({ action: 'approve', submission_id: check.submission_id, check_id: check.id, candidate: check.candidate, target: check.target, policy_hash: check.policy_hash });
+  assert.equal((await env.request('alice', 'respond', action(status.checks[1]))).status, 409);
+  assert.equal((await env.request('alice', 'respond', action(status.checks[0]))).status, 200);
+  await env.until(status => status.submissions.find(row => row.id === a.id)?.state === 'integrated');
+  assert.equal((await env.request('alice', 'respond', action(status.checks[1]))).status, 200);
+  const final = await env.until(status => status.submissions.find(row => row.id === b.id)?.state === 'integrated');
+  assert.equal(final.checks.length, 2);
+});
 
 test('FIFO integration preserves earlier target changes in a three-way candidate', async t => {
   const env = await setup(t);

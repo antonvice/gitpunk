@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -14,7 +14,10 @@ export async function runMvpExample(root = '.local/mvp') {
   const runtime = JSON.parse(await readFile(join(root, 'runtime.json'), 'utf8'));
   assert.equal(runtime.mode, 'local-development');
   assert.equal(runtime.workspaces.source, join(root, 'source'), 'Example only runs on its generated starter repository');
-  for (const workspace of [runtime.workspaces.alice, runtime.workspaces.bob]) assert.equal(await git(workspace, 'status', '--porcelain'), '', 'Example refuses to overwrite unfinished work');
+  for (const workspace of [runtime.workspaces.alice, runtime.workspaces.bob]) {
+    if (runtime.remote) assert.equal((await readdir(workspace)).length, 0, 'Remote example requires fresh empty workspaces');
+    else assert.equal(await git(workspace, 'status', '--porcelain'), '', 'Example refuses to overwrite unfinished work');
+  }
   const agents = {};
   try {
     for (const name of ['alice', 'bob']) {
@@ -52,8 +55,13 @@ export async function runMvpExample(root = '.local/mvp') {
     assert.equal(await readFile(join(runtime.workspaces.bob, 'services.py'), 'utf8'), service);
     assert.equal(await readFile(join(runtime.workspaces.bob, 'tests/test_crud.py'), 'utf8'), tests);
     await bob.call('gitpunk_respond', { response: { action: 'prepare_write', files: ['services.py', 'tests/test_crud.py'] } });
-    await git(runtime.workspaces.bob, 'add', 'services.py', 'tests/test_crud.py');
-    await git(runtime.workspaces.bob, '-c', 'user.name=Gitpunk scripted example', '-c', 'user.email=example@example.invalid', 'commit', '-m', 'Implement handed-off Car CRUD contract');
+    if (runtime.remote) {
+      await wait(value => value.checkpoints.filter(item => item.intent_id === accepted.intent.id).length === 2);
+      await bob.call('gitpunk_respond', { response: { action: 'commit', message: 'Implement handed-off Car CRUD contract' } });
+    } else {
+      await git(runtime.workspaces.bob, 'add', 'services.py', 'tests/test_crud.py');
+      await git(runtime.workspaces.bob, '-c', 'user.name=Gitpunk scripted example', '-c', 'user.email=example@example.invalid', 'commit', '-m', 'Implement handed-off Car CRUD contract');
+    }
     await wait(value => value.integration?.submissions.some(item => item.state === 'awaiting_approval'));
     const submission = status.integration.submissions.find(item => item.state === 'awaiting_approval');
     const check = status.integration.checks.find(item => item.id === submission.check_id);
@@ -62,7 +70,7 @@ export async function runMvpExample(root = '.local/mvp') {
     // Explicitly scripted owner approval for this generated fixture, never a human-review claim.
     await alice.call('gitpunk_respond', { response: { action: 'approve', submission_id: submission.id, check_id: check.id, target: check.target, candidate: check.candidate, policy_hash: check.policy_hash } });
     await wait(value => value.integration.submissions.some(item => item.id === submission.id && item.state === 'integrated'));
-    const receipt = { mode: 'scripted MCP example; real HTTP/Git/Kafka/Docker; scripted owner approval', board: runtime.board, save_to_peer_ms: saveToPeerMs, intent: work.intent_id, overlap_blocked: true, decision: decision.id, handoff: offer.id, continuation: accepted.intent.id, pinned_files: offer.checkpoint_ids.length, submission: submission.id, check: check.id, canonical: check.candidate, integration: 'integrated', cloud_writes: false, llm_calls: 0 };
+    const receipt = { mode: 'scripted MCP example; real HTTP/Git/Kafka/Docker; scripted owner approval', remote: runtime.remote || false, board: runtime.board, save_to_peer_ms: saveToPeerMs, intent: work.intent_id, overlap_blocked: true, decision: decision.id, handoff: offer.id, continuation: accepted.intent.id, pinned_files: offer.checkpoint_ids.length, submission: submission.id, check: check.id, canonical: check.candidate, integration: 'integrated', cloud_writes: false, llm_calls: 0 };
     await writeFile(join(root, 'example-receipt.json'), JSON.stringify(receipt, null, 2) + '\n', { mode: 0o600 });
     return receipt;
   } finally { await Promise.allSettled(Object.values(agents).map(agent => agent.client.close())); }

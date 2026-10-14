@@ -93,3 +93,23 @@ test('frequent saves and check logs do not crowd out agent status', () => {
   assert.equal(summary.integration.checks[0].result.state, 'failed');
   assert.ok(JSON.stringify(summary).length < 4096, 'Routine replies must not contain the entire test log');
 });
+
+test('MVP remote profiles hydrate declared files and commit through the same three MCP tools', { timeout: 20_000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'gitpunk-mvp-remote-'));
+  const app = await startMvp({ root, port: 0, checks: false, remote: true });
+  t.after(async () => { await app.stop(); await rm(root, { recursive: true, force: true }); });
+  const alice = await agent(t, app.receipt.profiles.alice, 'legacy');
+  await alice.call('gitpunk_work', { intent });
+  const base = (await alice.call('gitpunk_status')).data.work.base_commit || app.server.gitStore.config.base_commit;
+  const source = await alice.call('gitpunk_status', { source: { action: 'file', commit: base, path: 'services.py' } });
+  assert.equal(source.error, false); assert.equal(source.data.text_trust, 'untrusted');
+  const file = join(app.receipt.workspaces.alice, 'services.py');
+  assert.equal(await readFile(file, 'utf8'), Buffer.from(source.data.content_base64, 'base64').toString());
+  await writeFile(file, 'changed_without_a_clone = True\n');
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline && !(await app.clients.alice.remoteStatus()).checkpoints.length) await delay(50);
+  const committed = await alice.call('gitpunk_respond', { response: { action: 'commit', message: 'Checkout-free commit' } });
+  assert.equal(committed.error, false); assert.equal(committed.data.provenance, 'server_commit');
+  assert.equal(await git(app.server.gitStore.directory, 'show', `${committed.data.commit}:services.py`), 'changed_without_a_clone = True');
+  await assert.rejects(stat(join(app.receipt.workspaces.alice, '.git')), { code: 'ENOENT' });
+});

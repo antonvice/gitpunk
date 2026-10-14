@@ -19,6 +19,7 @@
     "demo": "node scripts/demo.js",
     "demo:checks": "node scripts/checked-demo.js",
     "demo:kafka-recovery": "node scripts/kafka-recovery.js",
+    "bench:scale": "node scripts/scale-benchmark.js",
     "demo:cloudflare": "node scripts/cloudflare-smoke.js",
     "test:docker": "GITPUNK_DOCKER_TESTS=1 node --test server/runner.test.js tests/checked-demo.test.js",
     "build:cloudflare": "wrangler deploy --dry-run --config server/cloudflare/wrangler.example.jsonc --outdir .local/cloudflare-build"

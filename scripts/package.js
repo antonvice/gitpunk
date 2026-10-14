@@ -5,7 +5,7 @@ import { resolve, join } from 'node:path';
 import { createHash } from 'node:crypto';
 
 const run = promisify(execFile), root = resolve('.'), output = join(root, '.local/release');
-const rootFiles = new Set(['.gitignore', 'AGENTS.md', 'README.md', 'MVP.md', 'Roadmap.md', 'SUBMISSION.md', 'techdoc.md', 'Suggestions.md', 'COSTS.md', 'LICENSE', 'package.json', 'package-lock.json']);
+const rootFiles = new Set(['.gitignore', 'AGENTS.md', 'README.md', 'MVP.md', 'SCALING.md', 'Roadmap.md', 'SUBMISSION.md', 'techdoc.md', 'Suggestions.md', 'COSTS.md', 'LICENSE', 'package.json', 'package-lock.json']);
 const { stdout } = await run('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'], { cwd: root });
 const files = [...new Set(stdout.split('\0').filter(file => rootFiles.has(file) || /^(client|server|shared|infra|examples|scripts|tests|\.github\/workflows)\//.test(file)))].sort();
 for (const file of files) {

@@ -14,7 +14,8 @@ const help = `Gitpunk: declare work and share saved drafts. Git remains unchange
 Connection: --profile FILE (or GITPUNK_PROFILE); saves the connection/workspace options.
 Or: --credentials FILE --identity alice|bob --workspace DIR --state-dir DIR
 Or: --server URL --repo ID --run ID --token-file FILE --key-file FILE
-Optional: --branch main --poll-ms 1000. Development HTTP is loopback only.
+Optional: --branch main --poll-ms 1000 --remote (workspace without .git).
+Development HTTP is loopback only.
 `;
 
 // Accept a human-friendly file list without adding more daily commands.
@@ -28,7 +29,7 @@ let client;
 try {
   const { values, positionals } = parseArgs({ args, allowPositionals: true, options: Object.fromEntries([
     ...['profile', 'credentials', 'identity', 'workspace', 'state-dir', 'server', 'repo', 'run', 'token-file', 'key-file', 'branch', 'poll-ms', 'file', 'files', 'type', 'summary', 'respond'].map(key => [key, { type: 'string' }]),
-    ...['json', 'once', 'help', 'upload', 'no-upload'].map(key => [key, { type: 'boolean' }]),
+    ...['json', 'once', 'help', 'upload', 'no-upload', 'remote'].map(key => [key, { type: 'boolean' }]),
   ]) });
   const [command, ...title] = positionals;
   if (values.help || !command) { process.stdout.write(help); process.exit(0); }

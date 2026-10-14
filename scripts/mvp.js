@@ -14,14 +14,19 @@ const exists = async file => { try { await access(file); return true; } catch (e
 const privateJson = async (file, value) => { await writeFile(file, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 }); await chmod(file, 0o600); };
 const project = fileURLToPath(new URL('../', import.meta.url));
 
-export async function startMvp({ root = '.local/mvp', port = 8787, source, kafkaBrokers = [], checks = true, runner } = {}) {
+export async function startMvp({ root = '.local/mvp', port = 8787, source, kafkaBrokers = [], checks = true, runner, remote = false } = {}) {
   root = resolve(root);
   await mkdir(root, { recursive: true, mode: 0o700 });
   await chmod(root, 0o700);
   const workspaces = { source: source ? resolve(source) : join(root, 'source'), alice: join(root, 'alice'), bob: join(root, 'bob') };
-  if (!source && !await exists(workspaces.source)) await createWorkspaces(root, { withTests: true });
+  if (!source && !await exists(workspaces.source)) await createWorkspaces(root, { withTests: true, remote });
   await head(workspaces.source);
   for (const name of ['alice', 'bob']) {
+    if (remote) {
+      await mkdir(workspaces[name], { recursive: true });
+      if (await exists(join(workspaces[name], '.git'))) throw new Error('Remote mode requires a fresh data directory without agent Git checkouts.');
+      continue;
+    }
     if (!await exists(workspaces[name])) await git(root, 'clone', workspaces.source, workspaces[name]);
     if (await git(workspaces[name], 'remote', 'get-url', 'origin') !== workspaces.source) throw new Error(`Existing ${name} workspace belongs to a different source; choose a different --data-dir.`);
     await head(workspaces[name]);
@@ -49,7 +54,7 @@ export async function startMvp({ root = '.local/mvp', port = 8787, source, kafka
       const credentials = join(root, `${name}.credentials.json`);
       await privateJson(credentials, { endpoint: started.endpoint, repository_id: 'demo', branch: 'main', identities: { [name]: fixture.identities[name] } });
       profiles[name] = join(root, `${name}.profile.json`);
-      await privateJson(profiles[name], { credentials, identity: name, workspace: workspaces[name], stateDir: join(root, `${name}-state`), upload: true });
+      await privateJson(profiles[name], { credentials, identity: name, workspace: workspaces[name], stateDir: join(root, `${name}-state`), upload: true, remote, cacheDir: join(root, 'source-cache') });
       await privateJson(join(root, `${name}.mcp.json`), { mcpServers: { gitpunk: { command: process.execPath, args: [join(project, 'client/mcp.js'), '--profile', profiles[name]] } } });
       await writeFile(join(root, `${name}.codex.toml`), `[mcp_servers.gitpunk]\ncommand = ${JSON.stringify(process.execPath)}\nargs = ${JSON.stringify([join(project, 'client/mcp.js'), '--profile', profiles[name]])}\nenabled_tools = ["gitpunk_work", "gitpunk_status", "gitpunk_respond"]\nstartup_timeout_sec = 10\n`, { mode: 0o600 });
       clients[name] = await GitpunkClient.create({ profile: profiles[name] });
@@ -69,7 +74,7 @@ export async function startMvp({ root = '.local/mvp', port = 8787, source, kafka
         }
       })());
     }
-    const receipt = { mode: 'local-development', endpoint: started.endpoint, board: `${started.endpoint}/board`, root, workspaces, profiles, board_profile: boardProfile, checks: checks ? 'pinned Docker; manual exact approval' : 'disabled; uploads stay unverified', kafka: kafkaBrokers.length ? 'configured; delivery visible in /health' : 'disabled; durable cursor polling remains available', cloud_writes: false, agent_models: 'Bring an MCP-capable coding agent; no model credentials are required by Gitpunk.' };
+    const receipt = { mode: 'local-development', remote, endpoint: started.endpoint, board: `${started.endpoint}/board`, root, workspaces, profiles, board_profile: boardProfile, checks: checks ? 'pinned Docker; manual exact approval' : 'disabled; uploads stay unverified', kafka: kafkaBrokers.length ? 'configured; delivery visible in /health' : 'disabled; durable cursor polling remains available', cloud_writes: false, agent_models: 'Bring an MCP-capable coding agent; no model credentials are required by Gitpunk.' };
     await privateJson(join(root, 'runtime.json'), { ...receipt, pid: process.pid, started_at: new Date().toISOString() });
     return { receipt, server, clients, stop };
   } catch (error) { await stop(); throw error; }
@@ -77,9 +82,9 @@ export async function startMvp({ root = '.local/mvp', port = 8787, source, kafka
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    const { values } = parseArgs({ options: { 'data-dir': { type: 'string' }, port: { type: 'string' }, source: { type: 'string' }, 'no-kafka': { type: 'boolean' }, 'no-checks': { type: 'boolean' } } });
+    const { values } = parseArgs({ options: { 'data-dir': { type: 'string' }, port: { type: 'string' }, source: { type: 'string' }, remote: { type: 'boolean' }, 'no-kafka': { type: 'boolean' }, 'no-checks': { type: 'boolean' } } });
     if (!values['no-kafka']) await run('docker', ['compose', '-f', join(project, 'infra/compose.yaml'), 'up', '-d'], { timeout: 30_000 });
-    const app = await startMvp({ root: values['data-dir'], port: Number(values.port || 8787), source: values.source, kafkaBrokers: values['no-kafka'] ? [] : ['127.0.0.1:9092'], checks: !values['no-checks'] });
+    const app = await startMvp({ root: values['data-dir'] || (values.remote ? '.local/mvp-remote' : undefined), port: Number(values.port || 8787), source: values.source, remote: values.remote, kafkaBrokers: values['no-kafka'] ? [] : ['127.0.0.1:9092'], checks: !values['no-checks'] });
     process.stdout.write(JSON.stringify(app.receipt, null, 2) + '\n');
     for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, async () => { await app.stop(); process.exit(0); });
   } catch (error) { process.stderr.write(`Gitpunk startup failed: ${error.message}\n`); process.exitCode = 1; }

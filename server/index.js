@@ -5,13 +5,14 @@ import { mkdir, chmod, readFile, writeFile, open } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { WorkRequest, CheckpointInput, RespondInput, GitUpload, CommitUploadEnvelope, CheckPolicy, ProtocolError, canonicalJson, generateKeyPair, verifyEnvelope } from '../shared/index.js';
+import { WorkRequest, CheckpointInput, RespondInput, GitUpload, CommitUploadEnvelope, SignedEnvelope, ServerCommit, SourceQuery, CheckPolicy, ProtocolError, canonicalJson, generateKeyPair, verifyEnvelope } from '../shared/index.js';
 import { createOutboxDispatcher } from './kafka.js';
 import { createGitStore } from './git-store.js';
 import { createCoordinator } from './coordinator.js';
 import { serveBoard } from './board.js';
 import { createHumanAuth } from './human-auth.js';
-import { checkScope, matches, intersects, secrets } from './policy.js';
+import { checkScope, checkReadScope, matches, intersects, secrets } from './policy.js';
+import { createSourceStore } from './source.js';
 
 const digest = value => createHash('sha256').update(value).digest('hex');
 const parsed = text => JSON.parse(text);
@@ -33,6 +34,8 @@ CREATE TABLE IF NOT EXISTS handoffs(id TEXT PRIMARY KEY, repo_id TEXT NOT NULL R
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE NOT NULL, repo_id TEXT NOT NULL REFERENCES repos(id), branch TEXT NOT NULL, seq INTEGER NOT NULL, type TEXT NOT NULL, run_id TEXT NOT NULL REFERENCES runs(id), payload TEXT NOT NULL, envelope TEXT NOT NULL, created_at INTEGER NOT NULL, delivered_at INTEGER, UNIQUE(repo_id,branch,seq));
 CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY, hash TEXT NOT NULL, response TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS uploads(id TEXT PRIMARY KEY, repo_id TEXT NOT NULL REFERENCES repos(id), run_id TEXT NOT NULL REFERENCES runs(id), intent_id TEXT NOT NULL REFERENCES intents(id), commit_id TEXT NOT NULL, state TEXT NOT NULL, data TEXT NOT NULL, envelope TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS source_requests(id TEXT PRIMARY KEY, hash TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS git_commits(repo_id TEXT NOT NULL REFERENCES repos(id), commit_id TEXT NOT NULL, PRIMARY KEY(repo_id,commit_id));
 `;
 
 function fail(code, message, status = 400, details) { throw new ProtocolError(code, message, status, details); }
@@ -71,6 +74,12 @@ export async function createGitpunkServer({ dataDir = '.local/server', port = 87
   let fixture;
   if (bootstrap) fixture = await seed(db, dataDir);
   const gitStore = await createGitStore({ dataDir, source: gitSource, db });
+  // Backfill accepted history once per old upload; a lost migration resumes by commit ID.
+  if (gitStore) for (const row of db.prepare("SELECT u.* FROM uploads u LEFT JOIN git_commits c ON c.repo_id=u.repo_id AND c.commit_id=u.commit_id WHERE u.state='uploaded' AND c.commit_id IS NULL").all()) {
+    const commits = await gitStore.history(parsed(row.data).base_commit, row.commit_id);
+    transaction(db, () => { for (const commit of commits) db.prepare('INSERT OR IGNORE INTO git_commits VALUES(?,?)').run(row.repo_id, commit); });
+  }
+  const sourceStore = gitStore && createSourceStore(gitStore, db);
   const uploadTasks = new Map();
   if (fixture && gitStore) fixture.git = { configured: true, base_commit: gitStore.config.base_commit, branch: gitStore.config.branch };
   function authenticate(request, repoId, write = false) {
@@ -217,6 +226,7 @@ export async function createGitpunkServer({ dataDir = '.local/server', port = 87
         if (already) { if (already.hash !== requestHash) fail('idempotency_conflict', 'Event ID already names other content.', 409); return parsed(already.response); }
         const data = { id: envelope.event_id, state: 'uploaded', intent_id: input.intent_id, intent_revision: input.intent_revision, branch: input.branch, commit: input.commit, base_commit: input.base_commit, workspace_id: input.workspace_id, git_ref: stored.ref, files: stored.files, history_commits: stored.commits, bundle_hash: input.bundle_hash, manifest: input, actor: actor(auth.id), signed: envelope, public_key: parsed(verifiedKey), checked: false, integrated: false };
         db.prepare('INSERT INTO uploads(id,repo_id,run_id,intent_id,commit_id,state,data,envelope,created_at) VALUES(?,?,?,?,?,\'uploaded\',?,?,?)').run(data.id, repoId, auth.id, input.intent_id, input.commit, JSON.stringify(data), JSON.stringify(envelope), Date.now());
+        for (const commit of stored.commit_ids) db.prepare('INSERT OR IGNORE INTO git_commits VALUES(?,?)').run(repoId, commit);
         const event = emit(auth, envelope, repoId, input.branch, 'commit.uploaded', data);
         const result = { ...data, blockers: [], next_actions: [], event };
         db.prepare('INSERT INTO requests(id,hash,response) VALUES(?,?,?)').run(envelope.event_id, requestHash, JSON.stringify(result));
@@ -225,6 +235,66 @@ export async function createGitpunkServer({ dataDir = '.local/server', port = 87
     })();
     uploadTasks.set(envelope.event_id, { hash: requestHash, promise: task });
     try { return await task; } finally { uploadTasks.delete(envelope.event_id); }
+  }
+  async function serverCommit(request, auth, repoId, body) {
+    if (!gitStore || repoId !== gitStore.config.repo_id) fail('git_not_configured', 'Trusted Git source required.', 503);
+    body = validate(SignedEnvelope, body);
+    if (!body || body.run_id !== auth.id || !await verifyEnvelope(body, parsed(auth.public_key))) fail('invalid_signature', 'Signed commit request required.', 401);
+    const input = validate(ServerCommit, body.payload), key = auth.public_key, scope = auth.scope;
+    auth = authenticate(request, repoId, true);
+    if (auth.public_key !== key || auth.scope !== scope) fail('scope_changed', 'Authority changed before admission.', 403);
+    const requestHash = digest(canonicalJson({ repoId, route: 'changesets', run_id: auth.id, payload: input }));
+    const prior = db.prepare('SELECT * FROM requests WHERE id=?').get(body.event_id);
+    if (prior) { if (prior.hash !== requestHash) fail('idempotency_conflict', 'Request ID was reused.', 409); return parsed(prior.response); }
+    const pending = uploadTasks.get(body.event_id);
+    if (pending) { if (pending.hash !== requestHash) fail('idempotency_conflict', 'Request ID was reused.', 409); return pending.promise; }
+    const task = (async () => {
+      const intent = writableIntent(auth, input.intent_id, input.intent_revision);
+      if (intent.base_commit !== input.base_commit || intent.branch !== input.branch || intent.workspace_id !== input.workspace_id) fail('base_mismatch', 'Commit must match the declared intent.', 409);
+      if (input.branch !== gitStore.config.branch) fail('unsupported_target', 'Unsupported canonical branch.', 409);
+      if (secrets(input.message)) fail('secret_detected', 'Commit message contains credential material.', 403);
+      const checkpoints = input.checkpoint_ids.map(id => {
+        const row = db.prepare('SELECT data FROM checkpoints WHERE id=? AND intent_id=? AND run_id=?').get(id, intent.id, auth.id);
+        if (!row) fail('checkpoint_mismatch', 'Commit pins checkpoints owned by this intent and run.', 409);
+        const item = parsed(row.data);
+        if (item.intent_revision !== intent.revision || item.base_commit !== intent.base_commit || item.workspace_id !== intent.workspace_id) fail('stale_checkpoint', 'Checkpoint no longer matches the intent.', 409);
+        checkScope(auth, item.path, item.operation);
+        if (!parsed(intent.data).files.includes(item.path)) fail('outside_intent', 'Checkpoint exceeds current intent.', 403);
+        return item;
+      });
+      if (new Set(checkpoints.map(item => item.path)).size !== checkpoints.length) fail('duplicate_path', 'Pin one checkpoint per path.');
+      for (const item of checkpoints) {
+        const entry = await sourceStore.metadata(input.base_commit, item.path);
+        const bytes = entry ? await sourceStore.bytes(entry) : null;
+        if ((bytes === null ? null : digest(bytes)) !== item.base_hash) fail('base_mismatch', 'Checkpoint baseline differs from its real Git parent.', 409);
+      }
+      const reserved = db.prepare('SELECT hash FROM source_requests WHERE id=?').get(body.event_id);
+      if (reserved && reserved.hash !== requestHash) fail('idempotency_conflict', 'Request ID was reused.', 409);
+      db.prepare('INSERT OR IGNORE INTO source_requests(id,hash) VALUES(?,?)').run(body.event_id, requestHash);
+      const ref = `refs/gitpunk/runs/${auth.id}/${body.event_id}`;
+      const commit = await gitStore.readRef(ref).catch(() => null) || await sourceStore.commit(input.base_commit, checkpoints, input.message, body.event_id);
+      const actual = await gitStore.changes(input.base_commit, commit);
+      if (!actual.length || actual.length !== checkpoints.length || actual.some(file => !checkpoints.some(item => item.path === file.path && item.base_hash === file.base_hash && item.result_hash === file.result_hash))) fail('manifest_mismatch', 'Created commit differs from the pinned drafts.', 409);
+      for (const file of actual) inspectCandidate({ data: JSON.stringify({ manifest: input }) }, auth, file);
+      const storedRef = await gitStore.recordCreated(commit, { eventId: body.event_id, runId: auth.id });
+      return transaction(db, () => {
+        auth = authenticate(request, repoId, true);
+        if (auth.public_key !== key || auth.scope !== scope) fail('scope_changed', 'Authority changed while creating the commit.', 403);
+        const current = writableIntent(auth, input.intent_id, input.intent_revision);
+        if (current.data !== intent.data || current.base_commit !== input.base_commit || current.workspace_id !== input.workspace_id) fail('intent_changed', 'Intent changed before admission.', 409);
+        const files = actual.map(({ baseBytes, resultBytes, ...file }) => file).sort((a, b) => a.path.localeCompare(b.path));
+        const manifest = { ...input, commit, files }; delete manifest.action; delete manifest.message; delete manifest.checkpoint_ids;
+        const data = { id: body.event_id, state: 'uploaded', intent_id: intent.id, intent_revision: intent.revision, branch: input.branch, commit, base_commit: input.base_commit, workspace_id: input.workspace_id, git_ref: storedRef, files, manifest, actor: actor(auth.id), signed: body, public_key: parsed(key), provenance: 'server_commit', checked: false, integrated: false };
+        db.prepare("INSERT INTO uploads(id,repo_id,run_id,intent_id,commit_id,state,data,envelope,created_at) VALUES(?,?,?,?,?,'uploaded',?,?,?)").run(data.id, repoId, auth.id, intent.id, commit, JSON.stringify(data), JSON.stringify(body), Date.now());
+        db.prepare('INSERT OR IGNORE INTO git_commits VALUES(?,?)').run(repoId, commit);
+        const event = emit(auth, body, repoId, input.branch, 'commit.uploaded', data);
+        const response = { ...data, blockers: [], next_actions: [], event };
+        db.prepare('INSERT INTO requests(id,hash,response) VALUES(?,?,?)').run(data.id, requestHash, JSON.stringify(response));
+        return response;
+      });
+    })();
+    uploadTasks.set(body.event_id, { hash: requestHash, promise: task });
+    try { return await task; } finally { uploadTasks.delete(body.event_id); }
   }
   function work(auth, envelope, input, repoId) {
     const id = input.id ?? randomUUID();
@@ -378,17 +448,25 @@ export async function createGitpunkServer({ dataDir = '.local/server', port = 87
       const url = new URL(request.url, 'http://localhost');
       if (await humanAuth.handle(request, response, url)) return;
       if (request.method === 'GET' && url.pathname === '/health') { response.end(JSON.stringify({ ok: true, data: { service: 'gitpunk', mode: 'local-development', storage: 'sqlite', human_login: { configured: humanAuth.configured }, git: { configured: !!gitStore }, checks: { configured: !!checkPolicy }, kafka: dispatcher.status() }, error: null })); return; }
-      const match = url.pathname.match(/^\/v1\/repos\/([^/]+)\/(work|checkpoints(?:\/[^/]+)?|commits(?:\/[^/]+(?:\/bundle)?)?|target(?:\/bundle)?|events|status|respond)$/);
+      const match = url.pathname.match(/^\/v1\/repos\/([^/]+)\/(work|checkpoints(?:\/[^/]+)?|commits(?:\/[^/]+(?:\/bundle)?)?|target(?:\/bundle)?|events|status|respond|git|changesets)$/);
       if (!match) fail('not_found', 'Route not found.', 404);
       const repoId = decodeURIComponent(match[1]), route = match[2];
-      const auth = authenticate(request, repoId, request.method === 'POST');
+      const auth = authenticate(request, repoId, request.method === 'POST' && route !== 'git');
       let data;
-      if (request.method === 'POST' && ['work','checkpoints','respond','commits'].includes(route)) {
+      if (request.method === 'POST' && ['work','checkpoints','respond','commits','git','changesets'].includes(route)) {
         const chunks = []; let bytes = 0;
         const limit = route === 'commits' ? 6 * 1024 * 1024 : 1_100_000;
         for await (const chunk of request) { bytes += chunk.length; if (bytes > limit) fail('body_too_large', 'Request exceeds the upload limit.', 413); chunks.push(chunk); }
         let body; try { body = JSON.parse(Buffer.concat(chunks).toString()); } catch { fail('invalid_json', 'Request body must be JSON.'); }
-        data = route === 'commits' ? await upload(request, auth, repoId, body) : await mutation(request, auth, repoId, route, body);
+        if (route === 'git') {
+          if (!sourceStore || repoId !== gitStore.config.repo_id) fail('git_not_configured', 'Trusted Git source required.', 503);
+          const input = validate(SourceQuery, body);
+          data = await sourceStore.query(input, (file, directory) => checkReadScope(auth, file, directory));
+          const current = authenticate(request, repoId);
+          if (input.action === 'tree') { if (input.path) checkReadScope(current, input.path, true); for (const entry of data.entries) checkReadScope(current, entry.path, entry.type === 'tree'); }
+          else if (input.action !== 'compare') for (const file of input.paths || [input.path]) checkReadScope(current, file);
+        } else if (route === 'changesets') data = await serverCommit(request, auth, repoId, body);
+        else data = route === 'commits' ? await upload(request, auth, repoId, body) : await mutation(request, auth, repoId, route, body);
       } else if (request.method === 'GET' && route === 'events') {
         const after = Number(url.searchParams.get('after') ?? url.searchParams.get('cursor') ?? 0), branch = url.searchParams.get('branch') ?? 'main';
         if (!Number.isSafeInteger(after) || after < 0) fail('invalid_cursor', 'Cursor must be a non-negative integer.');
@@ -413,7 +491,12 @@ export async function createGitpunkServer({ dataDir = '.local/server', port = 87
         if (!upload) fail('not_found', 'Accepted upload not found.', 404);
         data = { ...parsed(upload.data), actor: actor(upload.run_id) };
         if (route.endsWith('/bundle')) {
-          data = { signed: parsed(upload.envelope), actor: actor(upload.run_id), public_key: parsed(upload.data).public_key, bundle_content: await gitStore.readBundle(id) };
+          if (data.provenance === 'server_commit') {
+            const exported = await gitStore.exportCreated(id, data.base_commit, data.commit);
+            const signed = parsed(upload.envelope);
+            const proofs = signed.payload.checkpoint_ids.map(id => parsed(db.prepare('SELECT envelope FROM events WHERE event_id=? AND repo_id=?').get(`${id}:draft.changed`, repoId).envelope));
+            data = { ...exported, provenance: 'server_commit', manifest: { ...data.manifest, bundle_hash: exported.bundle_hash }, signed, checkpoints: proofs, actor: actor(upload.run_id), public_key: data.public_key };
+          } else data = { signed: parsed(upload.envelope), actor: actor(upload.run_id), public_key: parsed(upload.data).public_key, bundle_content: await gitStore.readBundle(id) };
           authenticate(request, repoId);
         }
       } else if (request.method === 'GET' && (route === 'target' || route === 'target/bundle')) {
@@ -445,7 +528,7 @@ export async function createGitpunkServer({ dataDir = '.local/server', port = 87
   server.requestTimeout = 15_000;
   server.headersTimeout = 10_000;
   return {
-    db, dataDir, fixture, dispatcher, gitStore, coordinator, humanAuth,
+    db, dataDir, fixture, dispatcher, gitStore, sourceStore, coordinator, humanAuth,
     async start() {
       await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve); });
       const address = server.address(), endpoint = `http://127.0.0.1:${address.port}`;

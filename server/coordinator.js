@@ -16,8 +16,10 @@ export function createCoordinator({ db, gitStore, policy: inputPolicy, authorize
     CREATE TABLE IF NOT EXISTS checks(id TEXT PRIMARY KEY, submission_id TEXT NOT NULL REFERENCES submissions(id), target TEXT NOT NULL, candidate TEXT, policy_hash TEXT NOT NULL, state TEXT NOT NULL, scope TEXT NOT NULL, signing_key TEXT NOT NULL, result TEXT, created_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS approvals(check_id TEXT PRIMARY KEY REFERENCES checks(id), run_id TEXT NOT NULL REFERENCES runs(id), data TEXT NOT NULL, envelope TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS integration_ops(id TEXT PRIMARY KEY, submission_id TEXT NOT NULL REFERENCES submissions(id), check_id TEXT NOT NULL REFERENCES checks(id), target TEXT NOT NULL, candidate TEXT NOT NULL, policy_hash TEXT NOT NULL, state TEXT NOT NULL, data TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS checks_candidate ON checks(candidate);
   `);
-  let timer, busy = false, stopped = false, lastError = null;
+  let timer, busy = false, stopped = false, lastError = null, peakChecks = 0, checksStarted = 0;
+  const jobs = new Map();
   const upload = id => db.prepare('SELECT * FROM uploads WHERE id=?').get(id);
   const check = id => db.prepare('SELECT * FROM checks WHERE id=?').get(id);
   function event(record, id, type, data) { return publish(record, id, type, { ...data, source_upload_id: record.id, origin: 'server' }); }
@@ -89,10 +91,9 @@ export function createCoordinator({ db, gitStore, policy: inputPolicy, authorize
       // If the old target remains, flush revalidates authority before retrying CAS.
     }
   }
-  async function evaluate(record, submission) {
+  async function prepare(record, target) {
     const actor = authorize(record);
     const manifest = json(record.data).manifest;
-    const target = await gitStore.readRef('refs/heads/main');
     const id = `check-${randomUUID()}`;
     tx(db, () => {
       db.prepare("UPDATE submissions SET state='checking',attempt=attempt+1,check_id=?,reason=NULL WHERE id=?").run(id, record.id);
@@ -110,53 +111,71 @@ export function createCoordinator({ db, gitStore, policy: inputPolicy, authorize
     // Validate Git's merged result, not only the originally uploaded patch.
     for (const change of await gitStore.candidateChanges(target, candidate.candidate)) inspect(record, actor, change);
     db.prepare("UPDATE checks SET candidate=?,state='running' WHERE id=?").run(candidate.candidate, id);
-    const returned = await runner({ directory: gitStore.directory, candidate: candidate.candidate, policy });
+    return check(id);
+  }
+  async function evaluate(record, prepared) {
+    const { id, target, candidate } = prepared;
+    const returned = await runner({ directory: gitStore.directory, candidate, policy });
     if (returned.target !== undefined && returned.target !== target) fail('invalid_check_binding', 'Runner returned a different target.');
     const result = CheckResult.parse({ ...returned, target });
-    if (result.candidate !== candidate.candidate || result.policy_hash !== policyHash || result.image_digest !== policy.image) fail('invalid_check_binding', 'Runner returned evidence for different code or environment.');
-    const state = result.state === 'passed' ? 'passed' : result.state;
+    if (result.candidate !== candidate || result.policy_hash !== policyHash || result.image_digest !== policy.image) fail('invalid_check_binding', 'Runner returned evidence for different code or environment.');
     tx(db, () => {
-      db.prepare('UPDATE checks SET state=?,result=? WHERE id=?').run(state, JSON.stringify(result), id);
-      db.prepare('UPDATE submissions SET state=?,reason=? WHERE id=?').run(state === 'passed' ? 'awaiting_approval' : 'failed', state === 'passed' ? null : state, record.id);
-      event(record, id, 'checks.finished', { id, submission_id: record.id, target, candidate: candidate.candidate, policy_hash: policyHash, state, result });
+      db.prepare('UPDATE checks SET state=?,result=? WHERE id=?').run(result.state, JSON.stringify(result), id);
+      db.prepare('UPDATE submissions SET state=?,reason=? WHERE id=?').run(result.state === 'passed' ? 'awaiting_approval' : 'failed', result.state === 'passed' ? null : result.state, record.id);
+      event(record, id, 'checks.finished', { id, submission_id: record.id, target, candidate, policy_hash: policyHash, state: result.state, result });
     });
-    if (state === 'passed') {
-      const checked = check(id);
-      if (gitStore.readRefSync('refs/heads/main') !== target) stale(record, checked, 'target_changed');
-      else if (policy.approval === 'automatic') integrate(record, checked);
+  }
+  function blocked(record, error) {
+    const op = db.prepare("SELECT * FROM integration_ops WHERE submission_id=? AND state='prepared'").get(record.id);
+    if (op && gitStore.readRefSync('refs/heads/main') === op.candidate) { lastError = 'Integration receipt pending recovery'; return false; }
+    tx(db, () => {
+      db.prepare("UPDATE checks SET state='error',result=? WHERE id=(SELECT check_id FROM submissions WHERE id=?) AND state IN ('building','running')").run(JSON.stringify({ state: 'error', code: error.code ?? 'coordinator_error', message: error.message }), record.id);
+      db.prepare("UPDATE submissions SET state='failed',reason=? WHERE id=?").run(error.code ?? 'coordinator_error', record.id);
+      event(record, `blocked-${randomUUID()}`, 'integration.blocked', { id: record.id, state: 'failed', reason: error.code ?? 'coordinator_error', message: error.message });
+    });
+    return true;
+  }
+  function admit() {
+    for (;;) {
+      const head = db.prepare("SELECT * FROM submissions WHERE state IN ('queued','checking','awaiting_approval') ORDER BY order_seq LIMIT 1").get();
+      if (!head || head.state !== 'awaiting_approval') return;
+      const record = upload(head.id), result = check(head.check_id);
+      try {
+        authorize(record);
+        if (gitStore.readRefSync('refs/heads/main') !== result.target || result.policy_hash !== policyHash) { stale(record, result, 'target_or_policy_changed'); continue; }
+        if (policy.approval === 'manual' && !db.prepare('SELECT 1 FROM approvals WHERE check_id=?').get(result.id)) return;
+        integrate(record, result);
+      } catch (error) { if (!blocked(record, error)) return; }
     }
   }
   async function flush() {
     if (busy || stopped || !gitStore || !policy) return;
     busy = true;
     try {
-      recover();
-      enqueue();
-      // FIFO includes an earlier passing submission waiting for its required approval.
-      for (;;) {
-        const submission = db.prepare("SELECT * FROM submissions WHERE state IN ('queued','awaiting_approval') ORDER BY order_seq LIMIT 1").get();
-        if (!submission) break;
+      lastError = null; recover(); enqueue(); admit();
+      let target = gitStore.readRefSync('refs/heads/main');
+      // A bounded prefix of exact combined candidates can be tested concurrently.
+      // Only the short, ordered CAS admission remains serial. Failed prefixes recheck.
+      const window = db.prepare("SELECT * FROM submissions WHERE state IN ('queued','checking','awaiting_approval') ORDER BY order_seq LIMIT ?").all(policy.check_concurrency);
+      for (const submission of window) {
         const record = upload(submission.id);
         try {
           authorize(record);
-          if (submission.state === 'queued') await evaluate(record, submission);
-          else {
-            const result = check(submission.check_id);
-            if (gitStore.readRefSync('refs/heads/main') !== result.target || result.policy_hash !== policyHash) { stale(record, result, 'target_or_policy_changed'); continue; }
-            if (policy.approval === 'manual' && !db.prepare('SELECT 1 FROM approvals WHERE check_id=?').get(result.id)) break;
-            integrate(record, result);
+          if (submission.state !== 'queued') {
+            const prepared = check(submission.check_id);
+            if (!prepared.candidate || prepared.target !== target) break;
+            target = prepared.candidate; continue;
           }
-        } catch (error) {
-          const op = db.prepare("SELECT * FROM integration_ops WHERE submission_id=? AND state='prepared'").get(record.id);
-          if (op && gitStore.readRefSync('refs/heads/main') === op.candidate) { lastError = 'Integration receipt pending recovery'; break; }
-          tx(db, () => {
-            db.prepare("UPDATE checks SET state='error',result=? WHERE id=(SELECT check_id FROM submissions WHERE id=?) AND state IN ('building','running')").run(JSON.stringify({ state: 'error', code: error.code ?? 'coordinator_error', message: error.message }), record.id);
-            db.prepare("UPDATE submissions SET state='failed',reason=? WHERE id=?").run(error.code ?? 'coordinator_error', record.id);
-            event(record, `blocked-${randomUUID()}`, 'integration.blocked', { id: record.id, state: 'failed', reason: error.code ?? 'coordinator_error', message: error.message });
-          });
-        }
+          if (jobs.size >= policy.check_concurrency || [...jobs.values()].some(job => job.submission_id === record.id)) break;
+          const prepared = await prepare(record, target);
+          if (!prepared) continue;
+          target = prepared.candidate;
+          const promise = evaluate(record, prepared).catch(error => blocked(record, error)).finally(() => jobs.delete(prepared.id));
+          jobs.set(prepared.id, { submission_id: record.id, promise });
+          checksStarted++; peakChecks = Math.max(peakChecks, jobs.size);
+        } catch (error) { if (!blocked(record, error)) break; }
       }
-      lastError = null;
+      recover(); admit();
     } catch (error) { lastError = error.message; }
     finally { busy = false; }
   }
@@ -186,8 +205,8 @@ export function createCoordinator({ db, gitStore, policy: inputPolicy, authorize
     },
     status({ repoId = 'demo', branch } = {}) {
       const allowed = new Set(db.prepare('SELECT id,data FROM uploads WHERE repo_id=?').all(repoId).filter(row => !branch || json(row.data).branch === branch).map(row => row.id));
-      return { configured: !!(policy && gitStore), approval: policy?.approval ?? null, policy_hash: policyHash, busy, last_error: lastError ? 'Coordinator needs attention; inspect scoped submission records.' : null, submissions: db.prepare('SELECT * FROM submissions ORDER BY order_seq').all().filter(row => allowed.has(row.id)), checks: db.prepare('SELECT * FROM checks ORDER BY rowid').all().filter(row => allowed.has(row.submission_id)).map(row => ({ id: row.id, submission_id: row.submission_id, target: row.target, candidate: row.candidate, policy_hash: row.policy_hash, state: row.state, result: row.result ? json(row.result) : null })), operations: db.prepare('SELECT id,submission_id,check_id,target,candidate,state FROM integration_ops ORDER BY rowid').all().filter(row => allowed.has(row.submission_id)) };
+      return { configured: !!(policy && gitStore), check_concurrency: policy?.check_concurrency || 1, running_checks: jobs.size, peak_checks: peakChecks, checks_started: checksStarted, approval: policy?.approval ?? null, policy_hash: policyHash, busy, last_error: lastError ? 'Coordinator needs attention; inspect scoped submission records.' : null, submissions: db.prepare('SELECT * FROM submissions ORDER BY order_seq').all().filter(row => allowed.has(row.id)), checks: db.prepare('SELECT * FROM checks ORDER BY rowid').all().filter(row => allowed.has(row.submission_id)).map(row => ({ id: row.id, submission_id: row.submission_id, target: row.target, candidate: row.candidate, policy_hash: row.policy_hash, state: row.state, result: row.result ? json(row.result) : null })), operations: db.prepare('SELECT id,submission_id,check_id,target,candidate,state FROM integration_ops ORDER BY rowid').all().filter(row => allowed.has(row.submission_id)) };
     },
-    async stop() { stopped = true; clearInterval(timer); while (busy) await new Promise(resolve => setTimeout(resolve, 20)); },
+    async stop() { stopped = true; clearInterval(timer); while (busy) await new Promise(resolve => setTimeout(resolve, 20)); await Promise.allSettled([...jobs.values()].map(job => job.promise)); },
   };
 }

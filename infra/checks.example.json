@@ -7,5 +7,6 @@
   "pids_limit": 64,
   "max_output_bytes": 65536,
   "max_source_bytes": 16777216,
+  "check_concurrency": 4,
   "approval": "manual"
 }

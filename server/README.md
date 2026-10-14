@@ -14,6 +14,8 @@ Add `--git-source=/absolute/path/to/repository` once to seed a local bare Git st
 
 Add `--check-config=infra/checks.example.json` to enable owner-configured Docker checks and the integration queue. Pull the pinned image first. Manual approval is the default; use a signed `respond:approve` naming the exact submission/check/target/candidate/policy tuple. Local integration supports configured `main` only. `retry_check` requests new evidence; failed work leaves the ready queue.
 
+`check_concurrency` bounds speculative FIFO checks (1–8; starter 4). Optional `source_paths` pins the exact files/directories exported to every check. Agents cannot choose these settings. Failed or stale prefixes recheck before ordered admission.
+
 `/board` shows intents, WIP diffs, decisions and check evidence. Its run token stays in tab memory; data routes remain authenticated.
 
 Optional [human OIDC login](AUTH.md) uses `--oidc-config` with a private provider configuration. Signup creates a separate human identity without repo grants; agent routes still require signed run credentials. Real provider setup and agent enrollment remain pending.
@@ -31,11 +33,15 @@ All repo routes use `/v1/repos/demo/`. Signed mutations use the shared protocol 
 | `GET status?branch=main` | Intents, claims, decisions, handoffs and delivery state |
 | `GET checkpoints/:id` | Authorized full draft content |
 | `POST commits` | Validate a signed commit manifest and detached Git bundle; upload working ref |
+| `POST git` | Scoped file/tree/snapshot/diff/compare/history/blame queries; no signature needed for reads |
+| `POST changesets` | Signed request pins drafts; server creates and validates an incremental Git commit |
 | `GET commits/:id` | Accepted commit, exact file manifest, signer and provenance |
-| `GET commits/:id/bundle` | Authorized bundle and original signed manifest for peer fetch |
-| `GET target`, `GET target/bundle` | Server-provenance canonical snapshot and bounded bundle |
+| `GET commits/:id/bundle` | Lazy bundle; ordinary signed manifest or server-commit request/draft proofs |
+| `GET target`, `GET target/bundle` | Cheap canonical head; explicit request exports a bounded bundle |
 
 Retries with the same event ID/payload return the original response. Reusing the ID for other content fails. State changes, events and delivery records commit together.
+
+Source uses 32 MiB of immutable cache, coalesces identical misses and caps concurrent queries at 16. Every API read rechecks current authorization. Accepted commit history is indexed; unadmitted refs are never a source capability. [Local benchmark and distributed-backend gate](../SCALING.md).
 
 Intents, drafts, status and events expose server-derived `actor: {run_id, agent_id, owner_id}`. Client-supplied owner labels never establish identity.
 

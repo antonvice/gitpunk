@@ -1,12 +1,13 @@
-import { readFile, mkdir, open, unlink, realpath } from 'node:fs/promises';
-import { resolve, join } from 'node:path';
+import { readFile, writeFile, mkdir, open, unlink, realpath } from 'node:fs/promises';
+import { resolve, join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { hashContent, hashBytes, canonicalJson, signEnvelope, verifyEnvelope, SafePath, IntentInput, WorkRequest, CheckpointInput, RespondInput, GitUpload, CommitUploadEnvelope, BundleContent, CheckResult, TargetBundle } from '../shared/index.js';
+import { hashContent, hashBytes, canonicalJson, signEnvelope, verifyEnvelope, verifyServerCommit, ServerCommit, SourceQuery, SafePath, IntentInput, WorkRequest, CheckpointInput, RespondInput, GitUpload, CommitUploadEnvelope, BundleContent, CheckResult, TargetBundle } from '../shared/index.js';
+import { SourceCache } from './source.js';
 import { ClientStore } from './store.js';
 import { withProfile } from './profile.js';
-import { git, head, atCommit, snapshot, restoreCheckpoints, committedFiles, exportCommitBundle, fetchCommitBundle, pinTargetCommit } from './git.js';
+import { git, head, atCommit, snapshot, safePath, restoreCheckpoints, committedFiles, exportCommitBundle, fetchCommitBundle, pinTargetCommit } from './git.js';
 
 export class ClientError extends Error {
   constructor(message, { code = 'client_error', status = 0, next_actions = [] } = {}) { super(message); this.code = code; this.status = status; this.next_actions = next_actions; }
@@ -39,6 +40,7 @@ export async function clientOptions(options = {}) {
   if (options.tokenFile) resolved.token = (await readFile(resolve(options.tokenFile), 'utf8')).trim();
   if (options.keyFile) resolved.privateKey = JSON.parse(await readFile(resolve(options.keyFile), 'utf8'));
   if (!resolved.run || !resolved.token || !resolved.privateKey) throw new ClientError('Provide a registered run, token file and private key file, or development credentials.', { code: 'credentials_missing' });
+  if (options.remote !== undefined && typeof options.remote !== 'boolean') throw new ClientError('Remote mode must be boolean.', { code: 'invalid_input' });
   const url = new URL(resolved.server);
   if (url.username || url.password) throw new ClientError('Use a token file; do not place credentials in the server URL.', { code: 'url_credentials' });
   if (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname))) throw new ClientError('HTTP is only allowed for loopback development servers.', { code: 'insecure_server' });
@@ -53,10 +55,11 @@ export class GitpunkClient {
     this.store = new ClientStore(join(options.stateDir, 'client.sqlite'));
     this.observations = new Map();
     this.baselines = new Map();
+    this.sourceCache = new SourceCache(query => this.source(query), options.cacheDir || join(options.stateDir, 'source-cache'));
     this.closed = false;
     const owner = this.store.get('owner');
-    if (owner && (owner.run !== options.run || owner.repo !== options.repo || owner.workspace !== options.workspace || owner.server !== options.server || owner.branch !== options.branch)) { this.store.close(); throw new ClientError('State directory belongs to another workspace, branch or run.', { code: 'state_owner_mismatch' }); }
-    this.store.set('owner', { run: options.run, repo: options.repo, workspace: options.workspace, server: options.server, branch: options.branch });
+    if (owner && (owner.run !== options.run || owner.repo !== options.repo || owner.workspace !== options.workspace || owner.server !== options.server || owner.branch !== options.branch || Boolean(owner.remote) !== Boolean(options.remote))) { this.store.close(); throw new ClientError('State directory belongs to another workspace, branch, mode or run.', { code: 'state_owner_mismatch' }); }
+    this.store.set('owner', { run: options.run, repo: options.repo, workspace: options.workspace, server: options.server, branch: options.branch, remote: Boolean(options.remote) });
     if (options.upload !== undefined) this.store.set('auto_upload', Boolean(options.upload));
     if (options.noUpload) this.store.set('auto_upload', false);
   }
@@ -73,6 +76,7 @@ export class GitpunkClient {
     if (!response.ok) throw new ClientError(body.error?.message || body.message || 'Request rejected.', { code: body.error?.code || body.code || 'rejected', status: response.status, next_actions: body.next_actions || body.error?.next_actions || [] });
     return body.data ?? body;
   }
+  async source(query) { return this.request('git', SourceQuery.parse(query)); }
   async enqueue(route, payload, attachment = null) {
     let envelope = await signEnvelope(payload, { eventId: randomUUID(), runId: this.options.run, privateKey: this.options.privateKey });
     if (attachment) {
@@ -93,10 +97,15 @@ export class GitpunkClient {
         if (item.route === 'respond' && item.envelope.payload.action === 'handoff_accept') this.acceptHandoff(response);
         if (item.route === 'respond' && item.envelope.payload.action === 'ack') this.store.consume(item.envelope.payload.event_seq);
         if (item.route === 'commits') this.acceptCommit(response, item.envelope);
+        if (item.route === 'changesets') {
+          this.store.set('commit', { commit: response.commit, intent_id: item.envelope.payload.intent_id, upload_id: item.id, upload: 'uploaded', state: 'committed', verification: 'unverified', provenance: 'server_commit' });
+          if (this.options.remote) this.store.set('workspace_base', response.commit);
+        }
         this.store.set('connection', { state: 'connected', at: new Date().toISOString(), error: null });
       } catch (error) {
         const permanent = error.status >= 400 && error.status < 500 && ![408, 429].includes(error.status);
         this.store.failed(item.id, { code: error.code || 'client_error', message: error.message, next_actions: error.next_actions || [] }, permanent);
+        if (item.route === 'work' && permanent && this.options.remote) this.store.set('hydrating', false);
         if (item.route === 'commits' && permanent) this.recordUpload(item.envelope.payload, { upload: 'rejected', upload_id: item.id, error: { code: error.code, message: error.message } });
         this.store.set('connection', { state: error.code === 'offline' ? 'disconnected' : 'blocked', at: new Date().toISOString(), error: { code: error.code, message: error.message } });
         if (!permanent) break;
@@ -112,6 +121,7 @@ export class GitpunkClient {
   acceptHandoff(response) {
     const continuation = response.intent;
     if (continuation) this.acceptWork(response, { intent: Object.fromEntries(['title', 'type', 'summary', 'files', 'done_when', 'sharing', 'prompt', 'context'].filter(key => continuation[key] !== undefined).map(key => [key, continuation[key]])), base_commit: continuation.base_commit, workspace_id: this.options.workspaceId, branch: this.options.branch });
+    if (continuation && this.options.remote) this.store.set('workspace_base', continuation.base_commit);
     this.store.set('import', { ...this.store.get('import'), state: 'accepted', decision_ids: response.decision_ids || [], remaining_criteria: response.remaining_criteria || [], continuation_intent_id: continuation?.id });
   }
   uploadKey(payload) { return `upload:${payload.intent_id}:${payload.intent_revision}:${payload.commit}`; }
@@ -127,11 +137,13 @@ export class GitpunkClient {
     if (this.store.get('work')) await this.remoteStatus().catch(error => { if (error.code !== 'offline') throw error; });
     const stored = this.store.get('work');
     const existing = stored && !['cancelled', 'handed_off', 'ready', 'complete', 'completed'].includes(stored.state) ? stored : null;
-    const payload = WorkRequest.parse({ intent, base_commit: existing?.base_commit || await head(this.options.workspace), workspace_id: this.options.workspaceId, branch: this.options.branch, ...(existing ? { id: existing.id, expected_revision: existing.revision } : {}) });
+    const payload = WorkRequest.parse({ intent, base_commit: existing?.base_commit || (this.options.remote ? this.store.get('workspace_base') || (await this.request('target')).commit : await head(this.options.workspace)), workspace_id: this.options.workspaceId, branch: this.options.branch, ...(existing ? { id: existing.id, expected_revision: existing.revision } : {}) });
+    if (this.options.remote) this.store.set('hydrating', true);
     const id = await this.enqueue('work', payload);
     await this.flush();
     const result = this.store.result(id);
     if (result.status === 'rejected') throw new ClientError(result.error.message, result.error);
+    if (this.options.remote && result.status === 'sent') await this.hydrateWork();
     return result.status === 'sent' ? result.response : { state: 'pending', event_id: id, blockers: ['offline'], next_actions: ['start sync when the server is available'] };
   }
   async remoteStatus() {
@@ -144,7 +156,7 @@ export class GitpunkClient {
       if (pending) this.store.set(pending.key, pending.value);
     }
     const target = remote.git?.target_commit;
-    if (target && this.store.get('target')?.commit !== target) this.store.set('target', { commit: target, base_commit: remote.git.base_commit, state: 'pending', attempts: 0, retry_after: 0, git_ref: null });
+    if (target && this.store.get('target')?.commit !== target) this.store.set('target', { commit: target, base_commit: remote.git.base_commit, state: this.options.remote ? 'available' : 'pending', attempts: 0, retry_after: 0, git_ref: null });
     this.updateCommitEvidence(remote);
     return remote;
   }
@@ -180,6 +192,7 @@ export class GitpunkClient {
     return response;
   }
   async fetchPeerUpdates() {
+    if (this.options.remote) return;
     for (const item of this.store.entries('peer_fetch:').filter(item => item.value.state === 'pending' && item.value.retry_after <= Date.now()).slice(0, 4)) {
       try { await this.fetchUploadedCommit(item.value.commit_id); }
       catch (error) {
@@ -189,6 +202,7 @@ export class GitpunkClient {
     }
   }
   async fetchTargetUpdate() {
+    if (this.options.remote) return;
     const pending = this.store.get('target');
     if (!pending || pending.state !== 'pending' || pending.retry_after > Date.now()) return;
     try {
@@ -211,7 +225,7 @@ export class GitpunkClient {
   }
   async observeFiles() {
     const work = this.store.get('work');
-    if (!work || work.state !== 'active') return;
+    if (!work || work.state !== 'active' || this.options.remote && this.store.get('hydrating')) return;
     for (const path of work.intent.files) {
       try {
         const captured = await snapshot(this.options.workspace, path);
@@ -219,7 +233,7 @@ export class GitpunkClient {
         this.store.remove(`file_error:${path}`);
         const hash = captured.content === null ? null : await hashContent(captured.content);
         const baseKey = `${work.base_commit}:${path}`;
-        if (!this.baselines.has(baseKey)) this.baselines.set(baseKey, await atCommit(this.options.workspace, work.base_commit, path));
+        if (!this.baselines.has(baseKey)) this.baselines.set(baseKey, await this.readBase(work.base_commit, path));
         const baseContent = this.baselines.get(baseKey);
         const baseHash = baseContent === null ? null : await hashContent(baseContent);
         const previous = this.store.get(`published:${path}`);
@@ -234,6 +248,7 @@ export class GitpunkClient {
     }
   }
   async observeCommit() {
+    if (this.options.remote) return;
     const commit = await head(this.options.workspace);
     const previous = this.store.get('head');
     const work = this.store.get('work');
@@ -268,6 +283,7 @@ export class GitpunkClient {
     await this.flush();
     try {
       await this.remoteStatus();
+      if (this.options.remote && this.store.get('hydrating')) await this.hydrateWork();
       const work = this.store.get('work');
       if (work?.state === 'active' && Date.now() - this.store.get('renewed_at', 0) > 30_000) {
         await this.enqueue('respond', { action: 'renew', intent_id: work.id });
@@ -288,6 +304,22 @@ export class GitpunkClient {
   }
   async respond(payload) {
     if (payload?.action === 'prepare_write') return this.prepareWrite(payload);
+    if (payload?.action === 'source_snapshot') {
+      const input = SourceQuery.parse({ ...payload, action: 'snapshot' });
+      return this.sourceCache.materialize(input.commit, input.paths, join(this.options.stateDir, `snapshot-${randomUUID()}`));
+    }
+    if (payload?.action === 'commit') {
+      const remote = await this.remoteStatus(), work = this.store.get('work');
+      if (!work || work.state !== 'active') throw new ClientError('Declare active work before committing.', { code: 'intent_missing' });
+      const latest = new Map((remote.checkpoints || []).filter(item => item.intent_id === work.id && item.intent_revision === work.revision && item.actor.run_id === this.options.run).map(item => [item.path, item]));
+      const checkpoint_ids = payload.checkpoint_ids || [...latest.values()].filter(item => item.base_hash !== item.result_hash).map(item => item.id);
+      if (!checkpoint_ids.length) throw new ClientError('No changed published drafts; wait for sync or save changes first.', { code: 'no_changes' });
+      const input = ServerCommit.parse({ action: 'commit', intent_id: work.id, intent_revision: work.revision, base_commit: work.base_commit, branch: this.options.branch, workspace_id: this.options.workspaceId, message: payload.message, checkpoint_ids });
+      const id = await this.enqueue('changesets', input); await this.flush();
+      const result = this.store.result(id);
+      if (result.status === 'rejected') throw new ClientError(result.error.message, result.error);
+      return result.response || { state: 'pending', event_id: id };
+    }
     payload = RespondInput.parse(payload);
     if (payload.action === 'handoff_accept') return this.importHandoff({ ...payload, workspace_id: this.options.workspaceId });
     if (payload.action === 'fetch_commit') return this.fetchUploadedCommit(payload.commit_id);
@@ -358,7 +390,7 @@ export class GitpunkClient {
     const remote = await this.request(`commits/${encodeURIComponent(id)}/bundle`);
     const signed = remote.signed;
     if (!signed || signed.event_id !== id || !await verifyEnvelope(signed, remote.public_key)) throw new ClientError('Uploaded commit signature is invalid.', { code: 'commit_signature_invalid' });
-    const manifest = GitUpload.parse(signed.payload);
+    const manifest = remote.provenance === 'server_commit' ? await verifyServerCommit(remote) : GitUpload.parse(signed.payload);
     if (signed.run_id !== remote.actor?.run_id) throw new ClientError('Uploaded commit actor does not match its signature.', { code: 'commit_actor_mismatch' });
     const bytes = Buffer.from(BundleContent.parse(remote.bundle_content), 'base64');
     if (await hashBytes(bytes) !== manifest.bundle_hash) throw new ClientError('Uploaded bundle differs from its signed hash.', { code: 'bundle_hash_mismatch' });
@@ -382,12 +414,12 @@ export class GitpunkClient {
     for (const checkpoint of checkpoints) {
       const hash = checkpoint.content === null ? null : await hashContent(checkpoint.content);
       if (hash !== checkpoint.result_hash) throw new ClientError('Handoff content hash does not match.', { code: 'checkpoint_hash_mismatch' });
-      const base = await atCommit(this.options.workspace, checkpoint.base_commit, checkpoint.path);
+      const base = await this.readBase(checkpoint.base_commit, checkpoint.path);
       const baseHash = base === null ? null : await hashContent(base);
       if (baseHash !== checkpoint.base_hash) throw new ClientError('Handoff baseline differs from its exact Git commit.', { code: 'checkpoint_base_mismatch' });
     }
     const branch = `gitpunk/handoff-${payload.handoff_id.replace(/[^a-zA-Z0-9-]/g, '').slice(0, 40)}`;
-    await restoreCheckpoints(this.options.workspace, checkpoints, branch);
+    await restoreCheckpoints(this.options.workspace, checkpoints, branch, { remote: Boolean(this.options.remote) });
     const id = await this.enqueue('respond', payload);
     this.store.set('import', { handoff_id: payload.handoff_id, checkpoint_ids: raw.map(item => item.id || item.checkpoint_id), branch, state: 'restored_pending_ack' });
     await this.flush();
@@ -410,6 +442,22 @@ export class GitpunkClient {
       try { process.kill(pid, 0); } catch (cause) { if (cause.code === 'ESRCH') { await unlink(path); return this.acquireLock(); } throw cause; }
       throw new ClientError('A sync service already owns this workspace.', { code: 'sync_already_running' });
     }
+  }
+  async readBase(commit, path) {
+    if (!this.options.remote) return atCommit(this.options.workspace, commit, path);
+    const bytes = (await this.sourceCache.files(commit, [path])).get(path);
+    return bytes === null ? null : new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+  }
+  async hydrateWork() {
+    const work = this.store.get('work');
+    if (!work || !['active', 'blocked'].includes(work.state)) return;
+    const files = await this.sourceCache.files(work.base_commit, work.intent.files);
+    for (const [path, bytes] of files) if (bytes !== null && (await snapshot(this.options.workspace, path)).content === null) {
+      const full = await safePath(this.options.workspace, path);
+      await mkdir(dirname(full), { recursive: true });
+      await writeFile(full, bytes, { flag: 'wx', mode: 0o600 }).catch(error => { if (error.code !== 'EEXIST') throw error; });
+    }
+    if (this.store.get('work')?.id === work.id && this.store.get('work')?.revision === work.revision) { if (!this.store.get('workspace_base')) this.store.set('workspace_base', work.base_commit); this.store.set('hydrating', false); }
   }
   async start({ signal, onTick } = {}) {
     await this.acquireLock();

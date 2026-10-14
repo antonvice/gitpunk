@@ -2,6 +2,8 @@
 
 Target server design. The local HTTP/SQLite prototype implements signed collaboration, Kafka publication, working commits, isolated Docker checks and ordered integration. The internal Workers/Artifacts bridge is deployed and live-verified. Production identity and cloud coordination remain open. Run instructions: [README.md](README.md). Client contract: [../techdoc.md](../techdoc.md).
 
+The local scaling slice is implemented: scoped source queries, bounded immutable cache, accepted-history index, server commits from signed drafts, selected check sources and concurrent candidate checks. [Measurements and boundaries](../SCALING.md). The production design below is a target, not a deployed distributed service.
+
 ## Responsibility
 
 Cloudflare stores Git and runs our API. We implement identity, access, intents, WIP, pub/sub and integration.
@@ -101,6 +103,8 @@ Initial scope: record signed decisions and offers through `/respond`, deliver th
 | `/repos/:id/git-access` | Mint short-lived authorized Git capability |
 | `/repos/:id/work`, `/repos/:id/respond` | Intent/scope updates and blocker responses |
 | `/repos/:id/checkpoints` | Upload signed WIP/content |
+| `/repos/:id/git` | Scoped file/tree/snapshot/diff/ancestry/history/blame queries |
+| `/repos/:id/changesets` | Create ordinary Git commits from signed pinned drafts |
 | `/repos/:id/events?after=...`, `/repos/:id/status` | Cursor polling and compact agent state |
 | `/repos/:id/submissions` | Commit manifests and integration requests |
 | `/internal/artifacts-events`, `/internal/runner-results` | Authenticated platform events/results |
@@ -137,6 +141,8 @@ The binding exposes reads/forks/token management; do not invent a merge API. The
 
 Earliest accepted eligible submission first, with dependency ordering. Failed work leaves the ready queue.
 
+The local coordinator prepares a bounded FIFO prefix, tests exact combined candidates concurrently and serializes only final admission. Failed/changed prefixes invalidate downstream evidence. Owner policy pins concurrency and optional source paths; agents cannot narrow checks. Manual approval binds the exact current target. This improves throughput without dropping the existing approval gate.
+
 Runner tests untrusted code in an isolated environment without server secrets or production database access. Results bind candidate hash, environment and policy. Required human approval remains explicit; automated approval is opt-in policy.
 
 One integrator per branch compares expected target, updates conditionally and reads back. If target moves, rebuild/recheck. Persist operation IDs and old/new refs to recover from crashes without duplicate integration. Repo permission and policy are checked again at final admission.
@@ -148,6 +154,8 @@ One Git repository: `client/`, `server/`, `shared/`, `infra/`. No nested `.git` 
 Local Kafka configuration lives in `infra/compose.yaml`. Worker binding template lives in `server/wrangler.example.jsonc`. Neither is a deployed server. D1/R2 resources, identity provider, Kafka hosting, gateway, runners and Artifacts subscriptions must be provisioned during implementation.
 
 [Internal Artifacts bridge](cloudflare/README.md): live create/fork/push/clone and exact binary reads passed. Read-only/fork permissions and token revocation were verified. The endpoint is disabled after testing; the full cloud coordinator remains planned.
+
+For larger repositories, keep the source API stable and move immutable objects and derived history behind scalable storage/cache readers. Workers/Artifacts do not automatically distribute the local SQLite log, check runners or bare Git mirror. Validate large-history load and outage recovery before claiming the [scale gate](../Roadmap.md).
 
 ## Sources
 

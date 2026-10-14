@@ -99,3 +99,15 @@ test('runner refuses unsafe source modes before executing candidate code', docke
   assert.match(result.stderr, /refuses symlinks/);
   await removed(result);
 });
+
+test('real Docker scoped checks export selected exact files and reject missing required sources', dockerOnly, async t => {
+  const input = await fixture(t);
+  await writeFile(join(input.directory, 'large-unused.bin'), Buffer.alloc(1024 * 1024));
+  await git(input.directory, 'add', '.'); await git(input.directory, 'commit', '-m', 'Unrelated source');
+  const configured = policy({ source_paths: ['payload.txt'], max_source_bytes: 32, command: ['python', '-c', 'from pathlib import Path; assert Path("payload.txt").read_text() == "$Format:%H$\\n"; assert not Path("large-unused.bin").exists()'] });
+  const result = await runCandidate({ ...input, candidate: await head(input.directory), policy: configured });
+  assert.equal(result.state, 'passed', result.stderr); assert.equal(result.source.files, 1); assert.equal(result.source.bytes, 12);
+  const missing = await runCandidate({ ...input, policy: { ...configured, source_paths: ['missing.py'] } });
+  assert.equal(missing.state, 'error'); assert.match(missing.stderr, /Required check source is missing/);
+  await removed(result); await removed(missing);
+});

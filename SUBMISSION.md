@@ -41,7 +41,7 @@ Use a fresh `.local/mvp-recording` directory; preserve the existing MVP. Label s
 
 **Project:** Gitpunk
 
-**Vision:** Coding agents should see each other's work before it becomes a conflict. Gitpunk keeps ordinary Git and adds required intent, live signed drafts, overlap acknowledgement, shared decisions and pinned handoffs. Combined candidates must pass isolated checks and exact owner approval before integration.
+**Vision:** Coding agents should see each other's work before it becomes a conflict. Gitpunk keeps ordinary Git and adds intent, signed drafts, decisions and pinned handoffs. Sparse agent workspaces use source APIs/shared caches and server commits without cloning history. Concurrent exact checks preserve owner approval and ordered integration. Local measurements are documented in SCALING.md; distributed Anthropic-scale operation remains a separate gate.
 
 **Cloudflare use:** An internal Worker uses the Artifacts binding to manage Git repositories, isolated forks and expiring repository credentials. Live tests verified push/clone, exact commit and binary read-back, fork isolation and revocation. Collaboration and checks currently run locally. Update this paragraph after the combined Artifacts workflow is verified.
 

@@ -5,6 +5,7 @@ import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { CheckPolicy, SafePath, canonicalJson, hashContent } from '../shared/index.js';
+import { readBlobs } from './git-objects.js';
 
 const exec = promisify(execFile);
 const docker = (...args) => exec('docker', args, { encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 10_000 });
@@ -22,20 +23,25 @@ function boundedLogs(result, limit) {
   return result;
 }
 
-async function exportTree(directory, candidate, destination, limit) {
+async function exportTree(directory, candidate, destination, limit, sourcePaths = []) {
   if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(candidate)) throw new Error('Runner requires an exact Git commit ID.');
   if ((await git(directory, 'cat-file', '-t', candidate)).stdout.toString().trim() !== 'commit') throw new Error('Runner candidate is not a commit.');
-  const listing = new TextDecoder('utf-8', { fatal: true }).decode((await git(directory, 'ls-tree', '-r', '-z', '--full-tree', candidate)).stdout).split('\0').filter(Boolean);
+  const listing = new TextDecoder('utf-8', { fatal: true }).decode((await git(directory, 'ls-tree', '-r', '-z', '-l', '--full-tree', candidate, '--', ...sourcePaths)).stdout).split('\0').filter(Boolean);
   if (listing.length > 4096) throw new Error('Runner source exceeds 4096 files.');
   let bytes = 0;
-  for (const entry of listing) {
+  const files = listing.map(entry => {
     const [metadata, path] = entry.split('\t');
-    const [mode, type, object] = metadata.split(' ');
+    const [mode, type, object, rawSize] = metadata.trim().split(/\s+/);
     SafePath.parse(path);
     if (type !== 'blob' || !['100644', '100755'].includes(mode)) throw new Error(`Runner refuses symlinks/submodules: ${path}`);
-    const size = Number((await git(directory, 'cat-file', '-s', object)).stdout.toString().trim());
+    const size = Number(rawSize);
     if (!Number.isSafeInteger(size) || size < 0 || (bytes += size) > limit) throw new Error('Runner source exceeds configured byte limit.');
-    const content = (await git(directory, 'cat-file', 'blob', object)).stdout;
+    return { path, object, size, mode };
+  });
+  const blobs = await readBlobs(directory, files.map(file => file.object), limit);
+  for (const path of sourcePaths) if (!files.some(file => file.path === path || file.path.startsWith(path + '/'))) throw new Error(`Required check source is missing: ${path}`);
+  for (const { path, object, size, mode } of files) {
+    const content = blobs.get(object);
     if (content.length !== size) throw new Error('Runner source blob size changed.');
     const full = join(destination, path);
     await mkdir(dirname(full), { recursive: true, mode: 0o755 });
@@ -83,7 +89,7 @@ export async function runCandidate({ directory, candidate, policy: input, signal
     if (!inspected?.RepoDigests?.includes(policy.image) || !/^sha256:[a-f0-9]{64}$/.test(inspected.Id)) throw new Error('Pinned image digest is not available locally; pull the exact configured image.');
     imageId = inspected.Id;
     await mkdir(workspace, { mode: 0o755 });
-    source = await exportTree(directory, candidate, workspace, policy.max_source_bytes);
+    source = await exportTree(directory, candidate, workspace, policy.max_source_bytes, policy.source_paths);
     result = await executeContainer(name, policy.image, workspace, policy, signal);
   } catch (error) { result = { ...result, state: 'error', stderr: error.message.slice(0, policy.max_output_bytes) }; }
   finally {

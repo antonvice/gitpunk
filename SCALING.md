@@ -1,0 +1,65 @@
+# Agent-scale Gitpunk
+
+Gitpunk addresses checkout traffic, duplicated objects, expensive client operations and serial checks while keeping ordinary Git. The local implementation is measured below. It is not a replacement for Anthropic's distributed Scion backend.
+
+## What works
+
+| Bottleneck from [Anthropic's article](https://www.anthropic.com/engineering/redesigning-source-control) | Gitpunk mechanism | Boundary |
+|---|---|---|
+| Every online agent copies repository history | Optional remote workspace: no `.git`; only declared baseline files download | Ordinary Git checkouts remain supported |
+| Jobs clone just to ask about source | Authorized file, tree, diff, merge-base/ancestry, history and blame APIs | Git computes uncached history on the server |
+| Identical objects download repeatedly | Immutable Git IDs; bounded shared server memory and node disk caches; coalesced server misses | Two local cache levels; no regional fleet yet |
+| Large pack negotiation for small tasks | Selected manifests and exact blobs; restartable per-file downloads | API files ≤1 MiB; text drafts ≤256 KiB |
+| Clients create and upload commits | Agent signs exact drafts/request; server writes changed blobs/trees and a Git commit | Git directory trees still cost their size; SQLite serializes metadata admission |
+| CI materializes unrelated source | Owner-pinned `source_paths`; batched blob reads; no Git checkout/index in runners | Owner must include the check's dependencies |
+| Work waits behind other checks | Concurrent checks of a bounded FIFO candidate prefix; short ordered CAS integration | Failed/changed prefixes recheck; approval stays explicit |
+| Monorepo permissions | Source reads and writes enforce path scope; cached reuse reauthorizes | Downloaded bytes cannot be recalled; local agents need isolation |
+| Full server mirrors outgrow a node | Stable source API separates client behavior from backend storage | Complete local bare Git store remains; distributed storage is next |
+
+Intents, signed WIP, Kafka/cursor pub/sub, decisions, handoffs, legacy Git upload/fetch and exact approvals remain intact. Accepted commit IDs are indexed; arbitrary objects and unadmitted refs are unreadable. Status calls do not build bundles. Legacy clients request bundles explicitly.
+
+Server-created commit provenance is precise: the agent signed the request and content hashes, while the server chose the Git commit ID. A legacy fetch verifies those signatures, the authenticated manifest, bundle hash and actual Git diff.
+
+## Run
+
+```sh
+npm start -- --remote
+# Another terminal, on the fresh starter:
+npm run demo:mvp -- --data-dir=.local/mvp-remote
+# Independent local benchmark; pinned Docker image must already be available:
+npm run bench:scale
+```
+
+Use generated `.local/mvp-remote/` profiles and the same three MCP tools. Declare work, call `prepare_write`, edit, wait for draft publication, then `respond({action:'commit', message:'...'})`. A commit does not mean checked or integrated.
+
+`status({source:{action:'file', commit, path}})` reads pinned source without a clone. `respond({action:'source_snapshot', commit, paths})` creates a fresh selected snapshot. New tasks preserve the workspace's own base, like a Git checkout; canonical updates remain visible through status and source queries without overwriting local edits.
+
+## Local measurements
+
+October 14, 2026; Node 26.3.0 / Apple Git 2.50.1; one Mac. Latest completed run:
+
+| Eight jobs read the same 4,622-byte file | Total time | Retained workspace bytes |
+|---|---:|---:|
+| Full Git clone via upload-pack | 6.738 s | 269,012,800 |
+| Native Git partial clone + sparse checkout | 1.256 s | 483,240 |
+| Gitpunk, cold shared node cache | 0.315 s | 36,976 |
+| Gitpunk, warm shared node cache | 0.161 s | 36,976 |
+
+Gitpunk's shared cache additionally retained 4,622 bytes. Cold API responses totaled 8,237 JSON bytes, including one file download; warm responses totaled 1,856 bytes and downloaded no file contents. Every job verified the same SHA-256. Git wire traffic was not measured: retained bytes are storage, not bandwidth.
+
+Fixture: 32 history commits, 16 MiB of deterministic unrelated binary source, eight jobs. Both Git baselines use `file://` upload-pack, avoiding hard-link clones; partial-clone filtering is enabled on the trusted fixture server. Server storage/setup is excluded from all timings. OS/Docker caches are not reset; order is fixed. These are small local trials, not production capacity estimates.
+
+| Eight exact candidates, real Docker contract checks | Serial | Four workers |
+|---|---:|---:|
+| Latest run | 8.598 s | 4.131 s |
+| First run | 10.336 s | 4.239 s |
+
+Each run integrated all eight changes once, preserved their content and bound evidence to target/candidate/image/policy. Each check exported 470 bytes from the owner-selected `parts` and `tests` directories instead of the unrelated 16 MiB. The contract performs real assertions and a 600,000-iteration checksum; no sleeps or mock runner are used. Four workers allow four CPUs/512 MiB of container memory at once. Benchmark approval is explicitly automatic; the MVP default is manual.
+
+The benchmark saves full private receipts under ignored `.local/scale-*/receipt.json`. No Cloudflare writes or model calls occur. The independent checkout-free MCP/Kafka/Docker example also integrated a two-file handoff with its agreed decision and owner approval; save-to-peer time was 1.436 s. These agents and approvals were scripted.
+
+## Scale gate
+
+The next backend must avoid a fully materialized repository on a single server. Keep this API, move immutable objects/derived data behind independently scalable storage and reader caches, bound metadata retention, and run checks in a worker pool. Validate cache outage/backpressure, exact conditional updates and revocation across nodes.
+
+Before claiming Anthropic-scale readiness, test 100 GB of history, a 25 GB worktree, sustained 30,000 merges/day and representative checkout/query demand. Measure p50/p95 latency, CPU, storage, bytes transferred, stale rechecks and failure recovery. Local benchmarks and a separate Artifacts bridge test cannot prove that gate. See [Roadmap](Roadmap.md).

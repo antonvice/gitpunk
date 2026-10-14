@@ -1,10 +1,12 @@
 # Roadmap
 
-Keep ordinary Git, three agent tools and one sync service per checkout. Finish each step with an end-to-end proof; add infrastructure only when the current step needs it.
+Keep ordinary Git, three agent tools and one sync service per workspace. Finish each step with an end-to-end proof; add infrastructure only when the current step needs it.
 
 ## Working local MVP
 
 Signed intents, path policy, automatic text WIP, overlap acknowledgement, durable cursor replay/Kafka, shared decisions, pinned handoffs, commit upload/fetch, Docker checks, exact approval, FIFO integration and the branch board work on the Mac. Restarts preserve credentials, drafts and history. Optional OIDC is tested with an offline provider.
+
+The scaling slice adds checkout-free file/tree/diff/ancestry/history/blame APIs, sparse agent workspaces, bounded immutable server/node caches, server commits from signed drafts, selected check sources and concurrent exact checks. [SCALING.md](SCALING.md) records the matched Git baselines and remaining limits.
 
 The separate Workers/Artifacts bridge passed real push/clone, fork isolation, binary read-back and token revocation. The local collaboration server still uses SQLite and a bare Git store. Scripted MCP clients prove the workflow; real model execution is unverified.
 
@@ -18,8 +20,11 @@ The separate Workers/Artifacts bridge passed real push/clone, fork isolation, bi
 | 4. Private pilot | Repo creation, team invites, owner review; install MCP and intercept managed write tools | Two invited users finish a task without editing private JSON; pre-write checks run automatically and managed agents cannot write protected files. |
 | 5. Hosted service | Workers API/UI, Durable Object branch ordering, Artifacts Git, D1/R2 only where needed, authenticated Kafka gateway | Two machines pass the existing flow, offline replay and stale-target tests within an approved monthly budget. |
 | 6. Reliable product | Backups/restore, quotas, retention, pagination, audit/export and Git history refs for portable provenance | Restore recovers accepted work; a long-running repo stays bounded; manifests survive ordinary Git history operations. |
+| 7. Agent-scale backend | Distributed immutable storage behind the source API, regional cache tiers, isolated reader replicas, runner pools and path-history indexes | A 100 GB history / 25 GB worktree fixture passes reads, writes, failures and revocation under measured sustained demand. Prove 30,000 merges/day and safe overload before claiming Anthropic-scale readiness. |
 
 Steps 1 and 2 form the submission gate. Step 4 is the first usable private product. Step 5 makes it a hosted product. There is no production deployment or agent-sandbox claim today.
+
+Step 7 is a separate scale gate. The local server retains a complete bare Git repository and one SQLite coordinator. Client caches and concurrent checks reduce work; they do not turn this store into a distributed backend. A single Artifacts bridge test is also insufficient evidence of that scale.
 
 ## Principles
 

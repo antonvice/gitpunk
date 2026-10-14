@@ -12,9 +12,9 @@ Working locally: signed intent/WIP, Kafka pub/sub, decisions, handoffs, commit u
 | `gitpunk work --file intent.json` | Declare or revise work |
 | `gitpunk status --json` | Read updates, blockers and evidence |
 
-Agents use `work`, `status`, `respond`. The last handles overlap, decisions, handoffs, approval, retry, cancel and finish. No command per feature. Keep ordinary `git add`, `commit`, `diff`, `log` and `merge`.
+Agents use `work`, `status`, `respond`. The last handles overlap, decisions, handoffs, commits, approval, retry and finish. No command per feature. Git checkouts keep ordinary Git commands; remote workspaces have no `.git`.
 
-One agent per isolated workspace and index. Multiple agents can target the same shared branch.
+One agent per isolated workspace. Multiple agents can target the same shared branch.
 
 ```text
 intent → edit → commit → upload → combined check → approval → integrate
@@ -56,9 +56,19 @@ Types: feature, change, bugfix, refactor, docs, test, maintenance. Revise the sa
 | Reconnect/restart | Replay events and retry pending publications/downloads |
 | Finish/cancel/handoff | Release or transfer claims; preserve history |
 
-`start --upload` enables uploads once; `--no-upload` pauses them. Never auto-stage, auto-commit or apply peer edits. Applying drafts, accepting a handoff and changing the working branch require explicit action.
+`start --upload` enables ordinary Git uploads once; `--no-upload` pauses them. Never auto-stage, auto-commit or apply peer edits. Applying drafts, accepting a handoff and changing the working branch require explicit action.
 
 Local state lives outside `.git`. One publisher per workspace. Text WIP is limited to 256 KiB/file; local bundles to 4 MiB. Binary drafts and hosted Git transport are later work.
+
+## Sparse agent workspaces
+
+`npm start -- --remote` creates workspaces without Git history or indexes. Declaring work downloads only the selected baseline files; existing edits are preserved. Saves use the same intent, permissions, signatures and pub/sub.
+
+- `status({source:{action:'file', commit, path}})` reads exact bytes. Other actions: tree, diff, compare, history, blame, snapshot.
+- `respond({action:'source_snapshot', commit, paths})` materializes selected files in a fresh directory.
+- `respond({action:'commit', message})` pins the latest published drafts and asks the server to create an ordinary Git commit. Optional `checkpoint_ids` pins specific drafts.
+
+Immutable IDs key the 32 MiB server cache and shared 32 MiB node cache. Every node-cache reuse gets a fresh authorized manifest. Server commits rebuild only affected trees; legacy bundles are exported on demand. The agent signs draft IDs/content and the request; the server determines the Git commit ID. [Scaling details](SCALING.md).
 
 ## Pub/sub
 
@@ -88,9 +98,11 @@ Files can differ while contracts collide. Combined tests catch behavioral failur
 | Checked | Owner-configured checks passed for an exact combined candidate |
 | Integrated | That checked candidate became the shared target |
 
-Consider accepted submissions in order. Failed/conflicting work leaves the ready queue; repairs are new uploads linked to the same intent. Pinned dependencies remain planned.
+Prepare a bounded FIFO prefix of combined candidates, then check them concurrently. Admission stays ordered. A failed or changed prefix invalidates dependent evidence and rechecks it. Failed/conflicting work leaves the ready queue; repairs are new uploads. Pinned dependencies remain planned.
 
 Tests bind target, candidate, image digest and policy hash. Default approval is manual and signed by an authorized maintainer/admin. Automated approval requires explicit owner policy. A development admin run is not proof that a human reviewed the change.
+
+Owner policy controls `check_concurrency` (1–8; starter uses 4) and optional `source_paths`. Only those required paths enter the runner; omitted dependencies are the owner's responsibility. Agents cannot select a smaller check scope or change commands.
 
 If target/policy/authority changes, invalidate old evidence and recheck. Persist the integration operation before Git's conditional ref update; recover the receipt after a crash without applying twice.
 

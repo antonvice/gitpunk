@@ -23,6 +23,11 @@ export function checkScope(auth, file, operation) {
   const scope = JSON.parse(auth.scope);
   if (!scope.operations.includes(operation) || !scope.files.some(pattern => matches(pattern, file))) fail('scope_denied', 'Run does not have permission for this operation/path.', 403, { path: file, operation });
 }
+export function checkReadScope(auth, file, directory = false) {
+  safePath(file);
+  const scope = JSON.parse(auth.scope);
+  if (!(scope.read_files || scope.files).some(pattern => matches(pattern, file) || directory && pattern.startsWith(file + '/'))) throw new ProtocolError('scope_denied', 'Run cannot read this path.', 403);
+}
 export function secrets(content) {
   return /-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----|\bAKIA[0-9A-Z]{16}\b|\b(?:sk-proj-|ghp_|github_pat_)[A-Za-z0-9_\-]{20,}/.test(content ?? '');
 }
