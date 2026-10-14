@@ -70,6 +70,7 @@ export async function runMvpExample(root = '.local/mvp') {
     // Explicitly scripted owner approval for this generated fixture, never a human-review claim.
     await alice.call('gitpunk_respond', { response: { action: 'approve', submission_id: submission.id, check_id: check.id, target: check.target, candidate: check.candidate, policy_hash: check.policy_hash } });
     await wait(value => value.integration.submissions.some(item => item.id === submission.id && item.state === 'integrated'));
+    await bob.call('gitpunk_respond', { response: { action: 'finish', intent_id: accepted.intent.id } });
     const receipt = { mode: 'scripted MCP example; real HTTP/Git/Kafka/Docker; scripted owner approval', remote: runtime.remote || false, board: runtime.board, save_to_peer_ms: saveToPeerMs, intent: work.intent_id, overlap_blocked: true, decision: decision.id, handoff: offer.id, continuation: accepted.intent.id, pinned_files: offer.checkpoint_ids.length, submission: submission.id, check: check.id, canonical: check.candidate, integration: 'integrated', cloud_writes: false, llm_calls: 0 };
     await writeFile(join(root, 'example-receipt.json'), JSON.stringify(receipt, null, 2) + '\n', { mode: 0o600 });
     return receipt;
